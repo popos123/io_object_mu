@@ -20,31 +20,108 @@
 # <pep8 compliant>
 
 import bpy
+import math
+from math import pi
 from mathutils import Vector, Quaternion
 
 from ..mu import MuAnimation, MuClip, MuCurve, MuKey
 from ..utils import strip_nnn
+from ..utils.action_compat import iter_action_fcurves
 
 from .light import light_types, light_power
+
+# Inverse of import_mu.animation.tau (degrees <-> radians for Euler curves)
+_rad2deg = -180.0 / pi
+
+def _mumatprop_data_path(data_path):
+    """Return data_path starting at mumatprop…, stripping pose.bones[] if present."""
+    if not data_path:
+        return None
+    if data_path.startswith("mumatprop."):
+        return data_path
+    marker = ".mumatprop."
+    if marker in data_path:
+        # Legacy bad imports: pose.bones["X"].mumatprop...
+        return "mumatprop." + data_path.split(marker, 1)[1]
+    return None
+
+def _action_has_mumatprop(action):
+    for curve in iter_action_fcurves(action):
+        dp_full = _mumatprop_data_path(curve.data_path)
+        if not dp_full:
+            continue
+        dp = dp_full.split(".")
+        if len(dp) > 1 and dp[1] in ["color", "vector", "float2", "float3",
+                                       "texture"]:
+            return True
+    return False
+
+def _is_fx_preview_anim(action_or_track):
+    """Viewport-only particle/FX Actions must not round-trip into .mu clips."""
+    if action_or_track is None:
+        return False
+    try:
+        if action_or_track.get("mu_fx_preview"):
+            return True
+    except Exception:
+        pass
+    try:
+        if action_or_track.get("mu_color_changer_preview"):
+            return True
+    except Exception:
+        pass
+    try:
+        name = getattr(action_or_track, "name", "") or ""
+        if name.endswith(".fx_preview") or name.startswith("mu_fx_"):
+            return True
+        if name.startswith("ColorChangerLights"):
+            return True
+    except Exception:
+        pass
+    return False
+
 
 def shader_animations(mat, path):
     animations = {}
     if not mat.animation_data:
         return animations
+    seen = set()
+
+    def add_track(track_or_action, clip_name):
+        action = track_or_action
+        if not isinstance(action, bpy.types.Action):
+            if _is_fx_preview_anim(track_or_action):
+                return
+            if not getattr(track_or_action, "strips", None):
+                return
+            action = track_or_action.strips[0].action
+        if not action or not _action_has_mumatprop(action):
+            return
+        if _is_fx_preview_anim(action):
+            return
+        # Shared materials are visited once per mesh user — dedupe Actions
+        key = action.as_pointer()
+        if key in seen:
+            return
+        seen.add(key)
+        # Prefer Mu clip name stored at import
+        name = clip_name
+        try:
+            if "mu_clip_name" in action and action["mu_clip_name"]:
+                name = action["mu_clip_name"]
+        except Exception:
+            pass
+        if name not in animations:
+            animations[name] = []
+        animations[name].append((track_or_action, path, mat))
+
     for track in mat.animation_data.nla_tracks:
-        if not track.strips:
-            continue
-        anims = []
-        strip = track.strips[0]
-        for curve in strip.action.fcurves:
-            dp = curve.data_path.split(".")
-            if dp[0] == "mumatprop" and dp[1] in ["color", "vector", "float2", "float3"]:
-                anims.append((track, path, mat))
-                break
-            elif dp[0] == "mumatprop" and dp[1] == "texture":
-                print("don't know how to export texture anims")
-        if anims:
-            animations[track.name] = anims
+        add_track(track, track.name)
+    # Also pick up an action assigned directly (no NLA)
+    if mat.animation_data.action:
+        act = mat.animation_data.action
+        clip = act.get("mu_clip_name") if hasattr(act, "get") else None
+        add_track(act, clip or act.name)
     return animations
 
 def object_animations(obj, path):
@@ -57,13 +134,23 @@ def object_animations(obj, path):
         typ = "arm"
     if obj.animation_data:
         for track in obj.animation_data.nla_tracks:
+            if _is_fx_preview_anim(track):
+                continue
             if track.strips:
-                animations[track.name] = [(track, path, typ)]
+                # Multiple NLA tracks can share a clip name (one Action per
+                # animated target created at import). Collect ALL of them.
+                strip_act = track.strips[0].action
+                if _is_fx_preview_anim(strip_act):
+                    continue
+                if track.name not in animations:
+                    animations[track.name] = []
+                animations[track.name].append((track, path, typ))
         # if nla_tracks exist, then action will be an nla track that has been
         # opened for tweaking, so export action only if there are no nla tracks
         if not animations and obj.animation_data.action:
             action = obj.animation_data.action
-            animations[action.name] = [(action, path, typ)]
+            if not _is_fx_preview_anim(action):
+                animations[action.name] = [(action, path, typ)]
     return animations
 
 def extend_animations(animations, anims):
@@ -72,18 +159,39 @@ def extend_animations(animations, anims):
             animations[a] = []
         animations[a].extend(anims[a])
 
+def _mu_export_path(obj, parent_path):
+    """Build the hierarchy path as it will appear in the exported .mu.
+
+    bindPose armatures collapse to their base name; *.skin meshes are folded
+    into that same MuObject — keep the parent path so material clips resolve.
+    """
+    from .armature import is_bindpose_armature, bindpose_base_name
+    name = strip_nnn(obj.name)
+    if type(obj.data) == bpy.types.Armature and is_bindpose_armature(obj):
+        seg = bindpose_base_name(obj)
+    elif (name.endswith(".skin") and obj.parent
+          and type(getattr(obj.parent, "data", None)) == bpy.types.Armature
+          and is_bindpose_armature(obj.parent)):
+        return parent_path
+    else:
+        seg = name
+    if parent_path:
+        return parent_path + "/" + seg
+    return seg
+
 def collect_animations(obj, path=""):
+    from .armature import is_bindpose_armature
     animations = {}
-    if path:
-        path += "/"
-    path += strip_nnn(obj.name)
-    extend_animations(animations, object_animations (obj, path))
+    path = _mu_export_path(obj, path)
+    # Do not collect NLA on the bindPose armature itself (control armature holds bone anims)
+    if not (type(obj.data) == bpy.types.Armature and is_bindpose_armature(obj)):
+        extend_animations(animations, object_animations(obj, path))
     if type(obj.data) == bpy.types.Mesh:
         for mat in obj.data.materials:
-            if mat: # material slot may be empty
+            if mat:  # material slot may be empty
                 extend_animations(animations, shader_animations(mat, path))
     if type(obj.data) in light_types:
-        extend_animations(animations, object_animations (obj.data, path))
+        extend_animations(animations, object_animations(obj.data, path))
     for o in obj.children:
         extend_animations(animations, collect_animations(o, path))
     return animations
@@ -120,14 +228,23 @@ def make_key(key, mult):
     x, y = key.co
     mukey.time = (x - bpy.context.scene.frame_start) / fps
     mukey.value = y * mult
-    dx, dy = key.handle_left
-    dx = (x - dx) / fps
-    dy = (y - dy) * mult
-    t1 = dy / dx
-    dx, dy = key.handle_right
-    dx = (dx - x) / fps
-    dy = (dy - y) * mult
-    t2 = dy / dx
+    if not math.isfinite(mukey.time):
+        mukey.time = 0.0
+    if not math.isfinite(mukey.value):
+        mukey.value = 0.0
+    lx, ly = key.handle_left
+    dx = (x - lx) / fps
+    dy = (y - ly) * mult
+    t1 = (dy / dx) if abs(dx) > 1e-12 and math.isfinite(dx) and math.isfinite(dy) else 0.0
+    rx, ry = key.handle_right
+    dx = (rx - x) / fps
+    dy = (ry - y) * mult
+    t2 = (dy / dx) if abs(dx) > 1e-12 and math.isfinite(dx) and math.isfinite(dy) else 0.0
+    # Unity stepped keys / bad Blender handles → keep packable floats
+    if not math.isfinite(t1) or abs(t1) > 1e6:
+        t1 = 0.0
+    if not math.isfinite(t2) or abs(t2) > 1e6:
+        t2 = 0.0
     mukey.tangent = [t1, t2]
     mukey.tangentMode = 0
     return mukey
@@ -159,35 +276,138 @@ property_map = {
         ("m_Intensity", 1/light_power, 2),
     ),
     "rotation_euler":(
-        ("localEulerAnglesRaw.x", 1, 0),
-        ("localEulerAnglesRaw.z", 1, 0),
-        ("localEulerAnglesRaw.y", 1, 0),
-    )
+        ("localEulerAnglesRaw.x", _rad2deg, 0),
+        ("localEulerAnglesRaw.z", _rad2deg, 0),
+        ("localEulerAnglesRaw.y", _rad2deg, 0),
+    ),
+    '["mu_light_enabled"]':(
+        ("m_Enabled", 1, 2),
+    ),
 }
+
+def _anim_host_of(track_or_action, fallback_path):
+    """Return host key for grouping MuAnimation clips.
+
+    Prefers ``mu_anim_bobj`` (unique Blender object name) so duplicate Unity
+    sibling names (RCSBlock×4 RCSthruster) do not collapse to one host.
+    Falls back to ``mu_anim_host`` path string.
+    Returns ``("bobj", name)`` or ``("path", path)``.
+    """
+    try:
+        action = track_or_action
+        if not isinstance(action, bpy.types.Action):
+            strips = getattr(track_or_action, "strips", None)
+            action = strips[0].action if strips else None
+        if action is not None:
+            try:
+                bname = action.get("mu_anim_bobj") if hasattr(action, "get") else None
+                if not bname and "mu_anim_bobj" in action:
+                    bname = action["mu_anim_bobj"]
+                if bname:
+                    return ("bobj", str(bname))
+            except Exception:
+                pass
+            try:
+                if "mu_anim_host" in action and action["mu_anim_host"]:
+                    return ("path", action["mu_anim_host"])
+            except Exception:
+                pass
+    except (TypeError, KeyError, IndexError, AttributeError):
+        pass
+    return ("path", fallback_path)
+
+
+def group_animations_by_host(animations, default_root):
+    """Split collected animations into per-host groups for nested MuAnimation."""
+    groups = {}
+    for clip_name, entries in animations.items():
+        for entry in entries:
+            track, path, typ = entry
+            host = _anim_host_of(track, default_root or path.split("/")[0])
+            if host not in groups:
+                groups[host] = {}
+            if clip_name not in groups[host]:
+                groups[host][clip_name] = []
+            groups[host][clip_name].append(entry)
+    if not groups and default_root:
+        groups[("path", default_root)] = animations
+    return groups
 
 vector_map={
     "color": (".r", ".g", ".b", ".a"),
     "vector": (".x", ".y", ".z", ".w"),
 }
 
-def make_curve(mu, muobj, curve, path, typ):
+_texture_vector_suffix = {
+    ("scale", 0): ".scale.x",
+    ("scale", 1): ".scale.y",
+    ("offset", 0): ".offset.x",
+    ("offset", 1): ".offset.y",
+}
+
+def make_curve(mu, muobj, curve, path, typ, action=None, anim_root=None):
     mucurve = MuCurve()
     mucurve.path = path
+    # Material curves may end up on an object NLA track — detect by data_path
+    if typ in {"obj", "lit", "arm"} and curve.data_path.startswith("mumatprop."):
+        return None  # collected via shader_animations instead
     if typ in {"obj", "lit"}:
+        # AudioSource ID props: ["mu_audio_…"] round-trip (AT_AUDIO_SOURCE=3)
+        dp = curve.data_path or ""
+        if ("mu_audio_" in dp) and (dp not in property_map):
+            stored = None
+            if action is not None:
+                try:
+                    key = "mu_uprop:%s:%d" % (dp, curve.array_index)
+                    if key in action:
+                        stored = action[key]
+                except Exception:
+                    stored = None
+            if not stored:
+                # Reconstruct Unity name from mu_audio_<name>
+                raw = dp.strip('["]')
+                if raw.startswith("mu_audio_"):
+                    stored = raw[len("mu_audio_"):]
+                else:
+                    return None
+            property = stored
+            mult = 1
+            ctyp = 3
+            mucurve.path = path
+            mucurve.property = property
+            mucurve.type = ctyp
+            mucurve.wrapMode = (8, 8)
+            mucurve.keys = []
+            for key in curve.keyframe_points:
+                mucurve.keys.append(make_key(key, mult))
+            return mucurve
+        if curve.data_path not in property_map:
+            return None
         property, mult, ctyp = property_map[curve.data_path][curve.array_index]
     elif typ == "arm":
         if "." in curve.data_path:
             bpath, dpath = curve.data_path.rsplit(".", 1)
             bone_path = muobj.bone_paths[bpath]
             bone = mu.object_paths[bone_path]
-            bone_path = bone_path[len(muobj.path):]
-            if bone_path[0] == '/':
+            # The Animation component's true host (anim_root) can sit one or
+            # more BONE-hops below the armature's own path (eg. a "DrillFixed"
+            # root bone whose Unity GameObject also owns the MuAnimation).
+            # Strip using the deeper of the two so bone paths stay relative
+            # to the real host instead of accidentally including the extra
+            # bone segment(s) — that duplication corrupted every position/
+            # rotation keyframe on TriBitDrill's control armature.
+            strip_prefix = muobj.path
+            if (anim_root and len(anim_root) > len(strip_prefix)
+                    and (anim_root == strip_prefix
+                         or anim_root.startswith(strip_prefix + "/"))):
+                strip_prefix = anim_root
+            bone_path = bone_path[len(strip_prefix):]
+            if bone_path[:1] == '/':
                 bone_path = bone_path[1:]
             if path and path[-1:] != "/":
                 path = path + "/"
             mucurve.path = path + bone_path
-            #print(mucurve.path)
-            property, mult, ctyp  = property_map[dpath][curve.array_index]
+            property, mult, ctyp = property_map[dpath][curve.array_index]
             if not hasattr(bone, "curves"):
                 bone.curves = {}
             if dpath not in bone.curves:
@@ -197,17 +417,53 @@ def make_curve(mu, muobj, curve, path, typ):
         else:
             dp = curve.data_path
             ai = curve.array_index
+            if dp not in property_map:
+                return None
             property, mult, ctyp = property_map[dp][ai]
     elif type(typ) == bpy.types.Material:
-        dp = curve.data_path.split(".")
-        v = {}
-        str = "v['property'] = typ.%s.name" % (".".join(dp[:-1]))
-        exec (str, {}, locals())
-        property = v["property"]
-        mult = 1
-        if dp[1] in ["color", "vector"]:
-            property += vector_map[dp[1]][curve.array_index]
-        ctyp = 1
+        dp_full = _mumatprop_data_path(curve.data_path)
+        if not dp_full:
+            return None
+        dp = dp_full.split(".")
+        # Prefer exact Unity property name stored at import
+        stored = None
+        if action is not None:
+            try:
+                key = "mu_uprop:%s:%d" % (dp_full, curve.array_index)
+                if key in action:
+                    stored = action[key]
+            except Exception:
+                stored = None
+        if stored:
+            property = stored
+            mult = 1
+            ctyp = 1
+        else:
+            try:
+                prop_rna = typ
+                for part in dp[:-1]:
+                    if part.endswith("]") and "[" in part:
+                        # properties[2]
+                        attr, idx = part[:-1].split("[", 1)
+                        prop_rna = getattr(prop_rna, attr)[int(idx)]
+                    else:
+                        prop_rna = getattr(prop_rna, part)
+                property = prop_rna.name
+            except Exception:
+                return None
+            mult = 1
+            if dp[1] in ["color", "vector"]:
+                property += vector_map[dp[1]][curve.array_index]
+            elif dp[1] == "texture":
+                # data_path: mumatprop.texture.properties[N].offset|scale
+                attr = dp[-1]
+                suf = _texture_vector_suffix.get((attr, curve.array_index))
+                if not suf:
+                    return None
+                property += suf
+            ctyp = 1
+    else:
+        return None
     mucurve.property = property
     # 0 = transform, 1 = material, 2 = light, 3 = audio source
     mucurve.type = ctyp
@@ -218,32 +474,50 @@ def make_curve(mu, muobj, curve, path, typ):
     return mucurve
 
 def transform_curves(muarm):
-    for bone in muarm.animated_bones:
+    # Called once per bone-track entry (see make_animations), but
+    # `animated_bones` accumulates every bone seen so far for the current
+    # clip. Consume (pop) it instead of merely iterating, otherwise a bone
+    # added on an early entry gets its location/rotation curves re-derived
+    # from rest on every later entry too — each pass adds another copy of
+    # the rest offset, compounding into wildly wrong keyframe values (eg.
+    # TriBitDrill's ~19x position blowup with ~20 animated control bones).
+    bones = list(muarm.animated_bones)
+    muarm.animated_bones.clear()
+    for bone in bones:
         if "location" in bone.curves:
             location = bone.curves["location"]
             if None in location:
-                print("Skipping incomplete location curve set")
-            elif ((len(location[0].keys) != len(location[1].keys))
-                  or (len(location[0].keys) != len(location[2].keys))):
-                print("Skipping mismatched location fcurve set")
+                print("INFO: Skipping incomplete location curve set")
             else:
-                for i in range(len(location[0].keys)):
-                    xk = location[0].keys[i].value
-                    yk = location[1].keys[i].value
-                    zk = location[2].keys[i].value
-                    loc = Vector((xk, yk, zk))
-                    loc += bone.transform.localPosition
-                    location[0].keys[i].value = loc.x
-                    location[1].keys[i].value = loc.y
-                    location[2].keys[i].value = loc.z
+                n = min(len(location[i].keys) for i in range(3))
+                if n == 0:
+                    print("INFO: Skipping empty location curve set")
+                else:
+                    if (len(location[0].keys) != n
+                            or len(location[1].keys) != n
+                            or len(location[2].keys) != n):
+                        print("INFO: Location curve key counts differ — "
+                              f"converting first {n} keys")
+                    # Inverse of import: blender_loc = rrot @ (unity_loc - lloc)
+                    rrot = getattr(bone, "relRotation", None) or Quaternion((1, 0, 0, 0))
+                    rrot_inv = rrot.inverted()
+                    lloc = Vector(bone.transform.localPosition)
+                    for i in range(n):
+                        xk = location[0].keys[i].value
+                        yk = location[1].keys[i].value
+                        zk = location[2].keys[i].value
+                        loc = rrot_inv @ Vector((xk, yk, zk)) + lloc
+                        location[0].keys[i].value = loc.x
+                        location[1].keys[i].value = loc.y
+                        location[2].keys[i].value = loc.z
         if "rotation_quaternion" in bone.curves:
             rotation = bone.curves["rotation_quaternion"]
             if None in rotation:
-                print("Skipping incomplete rotation fcurve set")
+                print("INFO: Skipping incomplete rotation fcurve set")
             elif ((len(rotation[0].keys) != len(rotation[1].keys))
                   or (len(rotation[0].keys) != len(rotation[2].keys))
                   or (len(rotation[0].keys) != len(rotation[3].keys))):
-                print("Skipping mismatched rotation fcurve set")
+                print("INFO: Skipping mismatched rotation fcurve set")
             else:
                 lrot = bone.transform.localRotation
                 for i in range(len(rotation[0].keys)):
@@ -296,17 +570,85 @@ def make_animations(mu, animations, anim_root):
         clip.wrapMode = 1
         #print(f"Creating clip: {clip_name}") # Debug clip animations
         
+        seen_actions = set()
         for data in animations[clip_name]:
             track, path, typ = data
+            # Normalize Blender-only segments (.skin / .bindPose / ∧nnn)
+            norm = "/".join(
+                strip_nnn(s).removesuffix(".skin").removesuffix(".bindPose")
+                for s in path.split("/")
+                if s and not strip_nnn(s).startswith("mesh:")
+            )
             muobj = mu.object_paths.get(path)
+            if muobj is None and norm != path:
+                muobj = mu.object_paths.get(norm)
+                if muobj:
+                    path = norm
+            if not muobj:
+                # Fallback: suffix / basename match (spaces, bindPose rename)
+                base = norm.rsplit("/", 1)[-1]
+                matches = [p for p in mu.object_paths if p == norm
+                           or p.endswith("/" + norm)
+                           or p.rsplit("/", 1)[-1] == base]
+                if not matches and base:
+                    tail = "/".join(norm.split("/")[-2:]) if "/" in norm else base
+                    matches = [p for p in mu.object_paths
+                               if p.endswith("/" + tail) or p.endswith("/" + base)]
+                if len(matches) == 1:
+                    path = matches[0]
+                    muobj = mu.object_paths[path]
+                elif matches:
+                    def score(p):
+                        a, b = p.split("/"), norm.split("/")
+                        n = 0
+                        for x, y in zip(reversed(a), reversed(b)):
+                            if x != y:
+                                break
+                            n += 1
+                        return n, len(p)
+                    path = max(matches, key=score)
+                    muobj = mu.object_paths[path]
+                else:
+                    path = norm
             if not muobj:
                 print(f"Object path not found: {path}")
                 continue
-            path = path[len(anim_root) + 1:]
-            action = track if isinstance(track, bpy.types.Action) else track.strips[0].action
+            # Curve paths are relative to the Animation host (anim_root)
+            if not anim_root or path == anim_root:
+                rel_path = ""
+            elif path.startswith(anim_root + "/"):
+                rel_path = path[len(anim_root) + 1:]
+            elif anim_root.startswith(path + "/"):
+                # anim_root is DEEPER than this entry's own recorded path
+                # (eg. a control armature's animation actually lives on a
+                # bone-child GameObject one or more hops below the armature's
+                # own path). The extra depth is handled by bone-path
+                # stripping in make_curve (against anim_root), so the outer
+                # prefix here must stay empty rather than re-adding it.
+                rel_path = ""
+            else:
+                # Object is not under this host — keep path as-is (best effort)
+                rel_path = path
+            action = track if isinstance(track, bpy.types.Action) else (
+                track.strips[0].action if getattr(track, "strips", None) else None)
             if action:
-                for curve in action.fcurves:
-                    curve_data = make_curve(mu, muobj, curve, path, typ)
+                # Shared material Actions are collected once per mesh user
+                ap = action.as_pointer()
+                if ap in seen_actions:
+                    continue
+                seen_actions.add(ap)
+                curve_rel = rel_path
+                # Material clips: prefer Unity path stored at import (shared mats)
+                if type(typ) == bpy.types.Material:
+                    try:
+                        if "mu_unity_curve_path" in action:
+                            curve_rel = action["mu_unity_curve_path"]
+                    except Exception:
+                        pass
+                for curve in iter_action_fcurves(action):
+                    curve_data = make_curve(
+                        mu, muobj, curve, curve_rel, typ, action=action,
+                        anim_root=anim_root)
                     if curve_data:
                         clip.curves.append(curve_data)
                 if hasattr(muobj, "animated_bones"):

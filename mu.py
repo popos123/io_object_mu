@@ -36,7 +36,7 @@ class MuEnum:
     ET_MESH_RENDERER = 8
     ET_SKINNED_MESH_RENDERER = 9
     ET_MATERIALS = 10
-    ET_MATERIAL = 11    #XXX not used?
+    ET_MATERIAL = 11  # legacy enum; materials are written via ET_MATERIALS
     ET_TEXTURES = 12
     ET_MESH_START = 13
     ET_MESH_VERTS = 14
@@ -258,7 +258,7 @@ def read_material3(self, mu):
         self.textureProperties["_MainTex"] = MuMatTex().read(mu)
     elif type == MuEnum.ST_ALPHA_SPECULAR:
         self.textureProperties["_MainTex"] = MuMatTex().read(mu)
-        #FIXME bogus
+        # Legacy ST_ALPHA_SPECULAR layout (pre-named props)
         self.floatProperties3["_Gloss"] = mu.read_float()
         self.colorProperties["_SpecColor"] = mu.read_float(4)
         self.floatProperties3["_Shininess"] = mu.read_float()
@@ -456,7 +456,7 @@ class MuAnimation:
         for clip in self.clips:
             clip.write(mu)
         mu.write_string(self.clip)
-        mu.write_byte(self.autoPlay)  #XXX is this right?
+        mu.write_byte(self.autoPlay)
 
 class MuBoneWeight:
     def __init__(self):
@@ -526,7 +526,7 @@ class MuMesh:
                 #print("    sub mesh")
                 num_tris = mu.read_int()
                 tris = []
-                for i in range(int(num_tris / 3)):   #FIXME is this guaranteed?
+                for i in range(int(num_tris / 3)):  # Unity stores 3 indices per tri
                     tri = mu.read_int(3)
                     #reverse the triangle winding for Blender (because of the
                     # LHS/RHS swap)
@@ -857,6 +857,7 @@ class MuParticles:
         self.count = mu.read_int()
         return self
     def write(self, mu):
+        mu.write_int(MuEnum.ET_PARTICLES)
         mu.write_byte(self.emit)
         mu.write_int(self.shape)
         mu.write_vector(self.shape3d)
@@ -996,6 +997,8 @@ class MuObject:
             self.camera.write(mu)
         if hasattr(self, "light") and self.light != None:
             self.light.write(mu)
+        if hasattr(self, "particles") and self.particles != None:
+            self.particles.write(mu)
         for child in self.children:
             mu.write_int(MuEnum.ET_CHILD_TRANSFORM_START)
             child.write(mu)

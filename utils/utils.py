@@ -42,6 +42,29 @@ def strip_nnn(name):
         return name
     return name[:ind]
 
+
+def is_hideable_collider_name(name):
+    """True for dedicated collider GOs; False for visuals named ``Collider``.
+
+    Stock telescopicLadderBay uses a MeshRenderer GO literally named
+    ``Collider`` for the bay housing — a naive ``\"collider\" in name`` hide
+    removes it from GIF/thumbnail renders. Importer children use
+    ``…∧collider``; pure hitboxes use names like ``ladderCollider``.
+    """
+    if not name:
+        return False
+    n = name.lower()
+    if n.startswith("mesh:"):
+        return True
+    wedge = "\u2227"
+    if (wedge + "collider") in n:
+        return True
+    base = n.split(wedge, 1)[0].strip()
+    if base == "collider":
+        return False
+    return "collider" in base
+
+
 def vector_str(vec):
     if len(vec) == 2:
         return "%.9g, %.9g" % vec

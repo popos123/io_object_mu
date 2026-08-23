@@ -27,7 +27,7 @@ from ..mu import Mu
 from ..mu import MuObject, MuTransform, MuTagLayer
 from ..utils import strip_nnn, collect_collections
 
-from .animation import collect_animations, find_path_root, make_animations
+from .animation import collect_animations, find_path_root, make_animations, group_animations_by_host
 from .collider import make_collider
 from .cfgfile import generate_cfg
 from .export_util import is_collider
@@ -36,6 +36,15 @@ from .volume import model_volume
 def make_transform(obj):
     transform = MuTransform()
     transform.name = strip_nnn(obj.name)
+    # Prefer Unity locals stored before bindPose SMR-space bake (colliders)
+    try:
+        if "mu_unity_rotation" in obj:
+            transform.localPosition = Vector(obj["mu_unity_location"])
+            transform.localRotation = Quaternion(obj["mu_unity_rotation"])
+            transform.localScale = Vector(obj["mu_unity_scale"])
+            return transform
+    except Exception:
+        pass
     transform.localPosition = Vector(obj.location)
     if obj.rotation_mode != 'QUATERNION':
       transform.localRotation = obj.rotation_euler.to_quaternion()
@@ -45,27 +54,20 @@ def make_transform(obj):
     return transform
 
 def make_tag_and_layer(obj):
-    def create_tag_layer(single_obj):
-        try:
-            # ORIGINAL code - working animations (patch 1)
-            tl = MuTagLayer()
-            tl.tag = single_obj.muproperties.tag # original: tl.tag = obj.muproperties.tag
-            tl.layer = single_obj.muproperties.layer # original: tl.layer = obj.muproperties.layer
-            return tl
-        except AttributeError as e:
-            print(f"Error processing object: {e}")
-            return None
-    # ALTERNATIVE code - handle damaged animations to export !!! (patch 1)
-    try:
-        if isinstance(obj, list):
-            return [create_tag_layer(single_obj) for single_obj in obj if create_tag_layer(single_obj) is not None]
-        else:
-            return create_tag_layer(obj)
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return None
+    tl = MuTagLayer()
+    tl.tag = obj.muproperties.tag
+    tl.layer = obj.muproperties.layer
+    return tl
 
 type_handlers = {} # filled in by the modules that handle the obj.data types
+
+def _object_has_animation(obj):
+    ad = getattr(obj, "animation_data", None)
+    if not ad:
+        return False
+    if ad.action:
+        return True
+    return any(getattr(t, "strips", None) for t in ad.nla_tracks)
 
 def find_single_collider(objects):
     colliders = []
@@ -73,91 +75,144 @@ def find_single_collider(objects):
         if is_collider(o):
             colliders.append(o)
     if len(colliders) == 1 and not colliders[0].muproperties.separate:
-        mat = colliders[0].matrix_local
+        col = colliders[0]
+        # Never inline a collider that still owns a hierarchy (common in
+        # Serenity parts: BoxCollider on an intermediate GO with meshes under
+        # it). Inlining would mark it exported and drop all descendants.
+        if col.children:
+            return None
+        # SP-10C etc.: separate Unity GOs named "collider 1" carry Mesh +
+        # MeshCollider and have their own transform animation. Inlining them
+        # drops object_paths entries and breaks clip export.
+        if _object_has_animation(col):
+            return None
+        if col.type == 'MESH' and col.data and len(col.data.vertices) > 0:
+            return None
+        mat = col.matrix_local
         mat = mat - mat.Identity(4)
         sum = 0
         for i in range(4):
             for j in range(4):
                 sum += mat[i][j]**2
         if sum < 1e-9:
-            return colliders[0]
+            return col
     return None
 
 def make_obj_core(mu, obj, path, muobj):
+    if path:
+        path += "/"
+    path += muobj.transform.name
+    muobj.path = path
+    mu.object_paths[path] = muobj
+    # Unique Blender name → MuObject (duplicate Unity sibling names collide in
+    # object_paths; material glow hosts need this map — RCSBlock×4 thrusters).
+    if not hasattr(mu, "blender_to_mu"):
+        mu.blender_to_mu = {}
     try:
-        # ORIGINAL code - working animations (patch 2)
-        if path:
-            path += "/"
-        path += muobj.transform.name
-        mu.object_paths[path] = muobj
-        muobj.tag_and_layer = make_tag_and_layer(obj)
-        if is_collider(obj):
+        mu.blender_to_mu[obj.name] = muobj
+    except Exception:
+        pass
+    muobj.tag_and_layer = make_tag_and_layer(obj)
+    # Collider on a GO that also has children/mesh must keep exporting the
+    # hierarchy (Serenity GoExOb etc.). Pure collider leaf → early out.
+    if is_collider(obj):
+        muobj.collider = make_collider(mu, obj)
+        has_exportable_kids = any(
+            (not is_collider(c) or c.children)
+            and ".preview" not in c.name
+            and ".fx_preview" not in c.name
+            and ".fx_emitter" not in c.name
+            and not c.get("mu_fx_preview")
+            for c in obj.children
+        )
+        if not has_exportable_kids and type(obj.data) not in type_handlers:
             mu.exported_objects.add(obj)
-            muobj.collider = make_collider(mu, obj)
+            # Still allow particles on a pure-collider leaf
+            from .empty import _particles_from_id_prop
+            particles = _particles_from_id_prop(obj)
+            if particles is not None:
+                muobj.particles = particles
             return muobj
-        elif type(obj.data) in type_handlers:
-            mu.path = path  #needs to be reset as a type handler might modify it
-            muobj = type_handlers[type(obj.data)](obj, muobj, mu)
-            if not muobj:
-                # the handler decided the object should not be exported
-                return None
-        mu.exported_objects.add(obj)
-        col = find_single_collider(obj.children)
-        if col:
-            mu.exported_objects.add(col)
-            muobj.collider = make_collider(mu, col)
-        for o in obj.children:
-            if o in mu.exported_objects:
-                # the object has already been exported
-                continue
-            child = make_obj(mu, o, path)
-            if child:
-                muobj.children.append(child)
-        return muobj
-    except TypeError as e:
-        if "unhashable type: 'list'" in str(e):
-            print(f"Warning: {e}. Switching to alternative code.")
-            # ALTERNATIVE code - handle damaged animations to export !!! (patch 2)
-            def process_single_obj(single_obj, muobj):
-                if path:
-                    current_path = path + "/"
-                else:
-                    current_path = ""
-                current_path += single_obj.name  # Changed from single_obj.transform.name to single_obj.name
-                mu.object_paths[current_path] = muobj
-                muobj.tag_and_layer = make_tag_and_layer(single_obj)
-                if is_collider(single_obj):
-                    mu.exported_objects.add(single_obj)
-                    muobj.collider = make_collider(mu, single_obj)
-                    return muobj
-                elif type(single_obj.data) in type_handlers:
-                    mu.path = current_path  # needs to be reset as a type handler might modify it
-                    updated_muobj = type_handlers[type(single_obj.data)](single_obj, muobj, mu)
-                    if not updated_muobj:
-                        # the handler decided the object should not be exported
-                        return None
-                    muobj = updated_muobj
-                mu.exported_objects.add(single_obj)
-                col = find_single_collider(single_obj.children)
-                if col:
-                    mu.exported_objects.add(col)
-                    muobj.collider = make_collider(mu, col)
-                for o in single_obj.children:
-                    if o in mu.exported_objects:
-                        # the object has already been exported
-                        continue
-                    child = make_obj(mu, o, current_path)
-                    if child:
-                        muobj.children.append(child)
-                return muobj
+    if type(obj.data) in type_handlers:
+        mu.path = path  #needs to be reset as a type handler might modify it
+        new_muobj = type_handlers[type(obj.data)](obj, muobj, mu)
+        if not new_muobj:
+            # the handler decided the object should not be exported
+            return None
+        # Keep object_paths in sync if the handler replaced the MuObject
+        if new_muobj is not muobj:
+            mu.object_paths[path] = new_muobj
+        muobj = new_muobj
+    # Particles may live on mesh/empty/armature hosts (Unity ParticleEmitter GO)
+    if not getattr(muobj, "particles", None):
+        from .empty import _particles_from_id_prop
+        particles = _particles_from_id_prop(obj)
+        if particles is not None:
+            muobj.particles = particles
+    mu.exported_objects.add(obj)
+    col = find_single_collider(obj.children)
+    if col:
+        mu.exported_objects.add(col)
+        muobj.collider = make_collider(mu, col)
+    for o in obj.children:
+        if o in mu.exported_objects:
+            # the object has already been exported
+            continue
+        # Objects parented to bones are exported via export_bone
+        if o.parent_type == 'BONE':
+            continue
+        # Blender-only particle preview / collider gizmo meshes
+        if (".preview" in o.name or ".fx_preview" in o.name
+                or ".fx_emitter" in o.name or ".cfg_preview" in o.name
+                or o.name.startswith("mesh:")
+                or o.get("mu_fx_preview")):
+            mu.exported_objects.add(o)
+            continue
+        # Export Active Variant: omit GAMEOBJECTS branches hidden by preview
+        if getattr(mu, "bake_active_variant", False) and o.get("mu_variant_hidden"):
+            mu.exported_objects.add(o)
+            continue
+        # A "<name>.bindPose" armature sibling that shares this object's own
+        # base name is the *same* source GameObject, just split into two
+        # Blender objects on import (eg. a GO with both a Collider and a
+        # SkinnedMeshRenderer becomes "<name>∧" + "<name>" collider +
+        # "<name>.bindPose" armature). Merge its SMR component back into
+        # this muobj instead of emitting a duplicate nested MuObject with
+        # the same name: a duplicate name confuses bone/hierarchy lookup on
+        # reimport and causes the container's scale to be applied twice to
+        # everything beneath it (eg. TriBitDrill's DrillBase 100x stretch).
+        from .armature import is_bindpose_armature, bindpose_base_name
+        if (type(o.data) == bpy.types.Armature and is_bindpose_armature(o)
+                and bindpose_base_name(o) == muobj.transform.name
+                and not getattr(muobj, "skinned_mesh_renderer", None)):
+            mu.exported_objects.add(o)
+            from .armature import handle_armature
+            handle_armature(o, muobj, mu)
+            # handle_armature/handle_bindpose only claims the skin mesh(es);
+            # any other child of the bindPose armature (rare) still needs
+            # the normal recursion make_obj_core would have given it.
+            for o2 in o.children:
+                if o2 in mu.exported_objects or o2.parent_type == 'BONE':
+                    continue
+                if (".preview" in o2.name or ".fx_preview" in o2.name
+                        or ".fx_emitter" in o2.name
+                        or o2.name.startswith("mesh:")
+                        or o2.get("mu_fx_preview")):
+                    mu.exported_objects.add(o2)
+                    continue
+                if (getattr(mu, "bake_active_variant", False)
+                        and o2.get("mu_variant_hidden")):
+                    mu.exported_objects.add(o2)
+                    continue
+                child = make_obj(mu, o2, path)
+                if child:
+                    muobj.children.append(child)
+            continue
+        child = make_obj(mu, o, path)
+        if child:
+            muobj.children.append(child)
+    return muobj
 
-            if isinstance(obj, list):
-                for single_obj in obj:
-                    muobj = process_single_obj(single_obj, muobj)
-            else:
-                muobj = process_single_obj(obj, muobj)
-            return muobj
-            
 def make_obj(mu, obj, path, extra=None):
     if obj in mu.exported_objects:
         # the object has already been "exported"
@@ -173,6 +228,10 @@ def make_obj(mu, obj, path, extra=None):
             return None
     muobj = MuObject()
     muobj.transform = make_transform (obj)
+    # Strip Blender-only .bindPose suffix before path registration
+    from .armature import is_bindpose_armature, bindpose_base_name
+    if type(obj.data) == bpy.types.Armature and is_bindpose_armature(obj):
+        muobj.transform.name = bindpose_base_name(obj)
     return make_obj_core(mu, obj, path, muobj)
 
 def calc_volumes(mu):
@@ -212,13 +271,15 @@ special_modelTypes = {
     'VOLUME': {},
 }
 
-def export_object(obj, filepath):
+def export_object(obj, filepath, bake_active_variant=False):
     animations = collect_animations(obj)
     anim_root = find_path_root(animations)
     mu = Mu()
     mu.exported_objects = set()
+    mu.bake_active_variant = bool(bake_active_variant)
     mu.name = strip_nnn(obj.name)
     mu.object_paths = {}
+    mu.blender_to_mu = {}
     mu.materials = {}
     mu.textures = {}
     mu.nodes = []
@@ -234,18 +295,78 @@ def export_object(obj, filepath):
     mu.CoPOffset = None
     mu.CoLOffset = None
     mu.anim_root = anim_root
-    if anim_root and "/" not in anim_root:
-        mu.messages.append(({'WARNING'}, "suggest buffer empty between root object and animated objects"))
+    # (Former WARNING "suggest buffer empty…" fired for nearly every stock
+    # part whose clips share a single-segment LCA — noise, not an error.)
     mu.inverse = obj.matrix_world.inverted()
     mu.special = special_modelTypes[mu.type]
     mu.obj = make_obj(mu, obj, "")
+    # Particle emitters (esp. Squad/FX) reference materials without a MeshRenderer.
+    # Pull those materials/textures into the export so the .mu matches stock.
+    try:
+        import json
+        from .material import make_material
+        for o in bpy.data.objects:
+            raw = o.get("mu_particle_materials") if hasattr(o, "get") else None
+            if not raw and not o.get("mu_particles"):
+                continue
+            names = []
+            if raw:
+                try:
+                    names = json.loads(raw) if isinstance(raw, str) else list(raw)
+                except Exception:
+                    names = []
+            if not names and o.get("mu_particles"):
+                # Fallback: any loaded particle-shader material
+                for mat in bpy.data.materials:
+                    sn = getattr(getattr(mat, "mumatprop", None), "shaderName", "") or ""
+                    if "particle" in sn.lower():
+                        names.append(mat.name)
+            for n in names:
+                mat = bpy.data.materials.get(n)
+                if mat is None:
+                    continue
+                key = mat.name
+                if key not in mu.materials:
+                    mu.materials[key] = make_material(mu, mat)
+    except Exception as e:
+        mu.messages.append(({'WARNING'}, f"particle materials export: {e}"))
     mu.materials = list(mu.materials.values())
     mu.materials.sort(key=lambda x: x.index)
     mu.textures = list(mu.textures.values())
     mu.textures.sort(key=lambda x: x.index)
-    if anim_root and anim_root in mu.object_paths:
-        anim_root_obj = mu.object_paths[anim_root]
-        anim_root_obj.animation = make_animations(mu, animations, anim_root)
+    # Prefer per-host MuAnimation (from import metadata); fall back to single LCA root.
+    host_groups = group_animations_by_host(animations, anim_root)
+    for host_key, host_anims in host_groups.items():
+        target = None
+        target_path = None
+        kind, val = host_key if (
+            isinstance(host_key, tuple) and len(host_key) == 2
+        ) else ("path", host_key)
+        if kind == "bobj":
+            target = getattr(mu, "blender_to_mu", {}).get(val)
+            if target is None:
+                # Name may have been remapped; try strip_nnn / prefix match
+                for bname, m in getattr(mu, "blender_to_mu", {}).items():
+                    if bname == val or bname.startswith(val + ".") or val.startswith(bname):
+                        target = m
+                        break
+            if target is not None:
+                target_path = getattr(target, "path", None) or anim_root
+        else:
+            target_path = val if val in mu.object_paths else anim_root
+            if target_path and target_path in mu.object_paths:
+                target = mu.object_paths[target_path]
+        if target is None:
+            continue
+        if not target_path:
+            target_path = getattr(target, "path", None) or anim_root or ""
+        new_anim = make_animations(mu, host_anims, target_path)
+        if hasattr(target, "animation") and target.animation and target.animation.clips:
+            target.animation.clips.extend(new_anim.clips)
+            if not target.animation.clip and new_anim.clip:
+                target.animation.clip = new_anim.clip
+        else:
+            target.animation = new_anim
     mu.write(filepath)
     mu.skin_volume, mu.ext_volume = model_volume(obj, mu.special)
     calc_volumes(mu)

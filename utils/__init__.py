@@ -31,3 +31,16 @@ else:
     from .object import collect_armature_modifiers, collect_modifiers
     from .transform import translate, rotate, scale
 from .utils import swapyz, swizzleq, strip_nnn, vector_str
+# action_compat imports bpy — only expose when running inside Blender
+try:
+    import bpy  # noqa: F401
+except ModuleNotFoundError:
+    pass
+else:
+    from .action_compat import (
+        iter_action_fcurves,
+        count_action_fcurves,
+        fcurve_new,
+        ensure_action_assigned,
+        push_action_to_nla,
+    )
