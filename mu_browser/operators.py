@@ -34,7 +34,9 @@ def refresh_part_list(context):
         item.attach_rules = ",".join(str(x) for x in (entry.attach_rules or ()))
         if br.thumbs_pending and entry.mu_path:
             try:
-                thumbnails.icon_id_for_part(entry.mu_path, ensure=False)
+                thumbnails.icon_id_for_part(
+                    entry.mu_path, entry.name, ensure=False
+                )
             except Exception:
                 pass
 
@@ -64,6 +66,7 @@ class KSPMU_OT_MuBrowserRefresh(bpy.types.Operator):
 
     def execute(self, context):
         from . import catalog
+        from . import thumbnails
         from ..preferences.preferences import Preferences
 
         gd = (Preferences().GameData or "").strip()
@@ -72,40 +75,232 @@ class KSPMU_OT_MuBrowserRefresh(bpy.types.Operator):
             return {"CANCELLED"}
         catalog.invalidate_cache()
         catalog.scan_gamedata(gd, force=True)
+        try:
+            thumbnails.invalidate_ksp_thumbs_index()
+            thumbnails.build_ksp_thumbs_index(gd, force=True)
+        except Exception:
+            pass
         refresh_part_list(context)
         n = len(context.window_manager.ksp_mu_browser.parts)
         self.report({"INFO"}, "Parts in category: %d" % n)
         return {"FINISHED"}
 
 
-class KSPMU_OT_MuBrowserGenThumbs(bpy.types.Operator):
-    """Generate missing thumbnails for the current category (lazy batch)."""
-    bl_idname = "object.ksp_mu_browser_gen_thumbs"
-    bl_label = "Generate Thumbnails"
+def _thumb_queue(br, *, force: bool, max_count: int):
+    """All parts in category (up to max_count).
+
+    Each entry: (mu_path, part_name, need_generate)
+    need_generate=False → only load icon (still advances progress).
+    """
+    from . import thumbnails
+
+    queue = []
+    for item in br.parts:
+        path = item.mu_path
+        if not path:
+            continue
+        need = True
+        if not force:
+            existing = None
+            try:
+                existing = thumbnails._resolve_cache_path(path, item.name)
+            except Exception:
+                existing = None
+            if existing:
+                need = False
+        queue.append((path, item.name or "", need))
+        if len(queue) >= int(max_count):
+            break
+    return queue
+
+
+def _progress_begin(context, total, title):
+    """Returns (cm, handle) — MUST keep cm alive until end."""
+    try:
+        from ..import_mu.progress_util import mu_progress_bar
+        cm = mu_progress_bar(context, total=total, title=title)
+        if hasattr(cm, "__enter__"):
+            handle = cm.__enter__()
+            return cm, handle
+        return cm, cm
+    except Exception:
+        return None, None
+
+
+def _progress_update(handle, current, total, title="Thumbnails"):
+    if handle is None:
+        return
+    for name in ("update", "step", "set", "set_progress", "tick"):
+        fn = getattr(handle, name, None)
+        if callable(fn):
+            try:
+                fn(current)
+                return
+            except TypeError:
+                try:
+                    fn(current, total)
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    for attr, val in (("current", current), ("progress", current), ("value", current)):
+        if hasattr(handle, attr):
+            try:
+                setattr(handle, attr, val)
+            except Exception:
+                pass
+
+
+def context_areas_safe():
+    try:
+        return list(bpy.context.screen.areas)
+    except Exception:
+        return []
+
+
+def _progress_end(cm, handle=None):
+    if cm is None:
+        return
+    if hasattr(cm, "__exit__"):
+        try:
+            cm.__exit__(None, None, None)
+            return
+        except Exception:
+            pass
+    for name in ("finish", "close", "done", "end"):
+        fn = getattr(cm, name, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
+class _ThumbBatchBase(bpy.types.Operator):
+    """Shared modal batch thumbnail generator with progress bar."""
     bl_options = {"REGISTER"}
 
-    max_count: IntProperty(name="Max", default=200, min=1, max=300)
+    max_count: IntProperty(name="Max", default=200, min=1, max=500)
+    force: BoolProperty(default=False)
 
-    def execute(self, context):
+    _queue = None
+    _done = 0
+    _index = 0
+    _timer = None
+    _progress = None
+    _progress_cm = None
+    _title = "Thumbnails"
+
+    def invoke(self, context, event):
+        br = context.window_manager.ksp_mu_browser
+        self._queue = _thumb_queue(
+            br, force=bool(self.force), max_count=int(self.max_count)
+        )
+        self._index = 0
+        self._done = 0
+
+        if not self._queue:
+            self.report({"INFO"}, "No parts in category")
+            return {"FINISHED"}
+
+        need_any = any(t[2] for t in self._queue)
+        if not need_any and not self.force:
+            from . import thumbnails
+            for path, name, _need in self._queue:
+                try:
+                    thumbnails.icon_id_for_part(path, name, ensure=False)
+                except Exception:
+                    pass
+            self.report({"INFO"}, "No thumbnails to generate")
+            return {"FINISHED"}
+
+        self._title = "Regen Thumbnails" if self.force else "Generate Thumbnails"
+        self._progress_cm, self._progress = _progress_begin(context, len(self._queue), self._title)
+
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            self._cleanup(context)
+            self.report({"WARNING"}, "Cancelled (%d done)" % self._done)
+            return {"CANCELLED"}
+
+        if event.type != "TIMER":
+            return {"RUNNING_MODAL"}
+
         from . import thumbnails
 
-        br = context.window_manager.ksp_mu_browser
-        done = 0
-        for item in br.parts:
-            if done >= int(self.max_count):
-                break
-            path = item.mu_path
-            if not path:
-                continue
-            cache = thumbnails._cache_path(path)
-            if os.path.isfile(cache) and os.path.getsize(cache) > 64:
-                thumbnails.icon_id_for_part(path, ensure=False)
-                continue
-            if thumbnails.generate_thumbnail(path):
-                thumbnails.icon_id_for_part(path, ensure=False)
-                done += 1
-        self.report({"INFO"}, "Generated %d thumbnails" % done)
-        return {"FINISHED"}
+        if self._index >= len(self._queue):
+            self._cleanup(context)
+            br = context.window_manager.ksp_mu_browser
+            for item in br.parts:
+                if item.mu_path:
+                    try:
+                        thumbnails.icon_id_for_part(
+                            item.mu_path, item.name, ensure=False
+                        )
+                    except Exception:
+                        pass
+            try:
+                for area in context_areas_safe():
+                    area.tag_redraw()
+            except Exception:
+                pass
+            self.report({"INFO"}, "%s: %d" % (self._title, self._done))
+            return {"FINISHED"}
+
+        path, name, need = self._queue[self._index]
+        self._index += 1
+        try:
+            if need or self.force:
+                result = thumbnails.generate_thumbnail(path, name, force=bool(self.force))
+                if result:
+                    thumbnails.icon_id_for_part(path, name, ensure=False)
+                    self._done += 1
+            else:
+                thumbnails.icon_id_for_part(path, name, ensure=False)
+        except Exception as e:
+            print("[mu_thumb] batch error:", e)
+
+        _progress_update(self._progress, self._index, len(self._queue), self._title)
+        try:
+            for area in context_areas_safe():
+                area.tag_redraw()
+        except Exception:
+            pass
+        return {"RUNNING_MODAL"}
+
+    def _cleanup(self, context):
+        wm = context.window_manager
+        if self._timer is not None:
+            try:
+                wm.event_timer_remove(self._timer)
+            except Exception:
+                pass
+            self._timer = None
+        _progress_end(self._progress_cm, self._progress)
+        self._progress_cm = None
+        self._progress = None
+
+
+class KSPMU_OT_MuBrowserGenThumbs(_ThumbBatchBase):
+    """Generate only missing thumbnails for the current category."""
+    bl_idname = "object.ksp_mu_browser_gen_thumbs"
+    bl_label = "Generate Thumbnails"
+
+    force: BoolProperty(default=False)
+
+
+class KSPMU_OT_MuBrowserRegenThumbs(_ThumbBatchBase):
+    """Force-regenerate thumbnails for the current category."""
+    bl_idname = "object.ksp_mu_browser_regen_thumbs"
+    bl_label = "Regenerate Thumbnails"
+
+    force: BoolProperty(default=True)
 
 
 class KSPMU_OT_MuBrowserSelect(bpy.types.Operator):
@@ -125,6 +320,12 @@ class KSPMU_OT_MuBrowserSelect(bpy.types.Operator):
         br.parts_index = i
         if hasattr(br, "grid_rows_index"):
             br.grid_rows_index = i // 3
+        return {"FINISHED"}
+        try:
+            for area in context_areas_safe():
+                area.tag_redraw()
+        except Exception:
+            pass
         return {"FINISHED"}
 
 
@@ -159,7 +360,6 @@ class KSPMU_OT_MuBrowserImportPart(bpy.types.Operator):
         except Exception as e:
             self.report({"ERROR"}, "Import failed: %s" % e)
             return {"CANCELLED"}
-        # Force the entire imported hierarchy to the world origin.
         try:
             import mathutils
             root.matrix_world = mathutils.Matrix.Identity(4)
@@ -176,10 +376,7 @@ class KSPMU_OT_MuBrowserImportPart(bpy.types.Operator):
 
         if br.like_ksp:
             snap.prepare_part_for_editor(root)
-            #snap.ensure_snap_handler()
             try:
-                #cursor = context.scene.cursor.location
-                #root.location = cursor.copy()
                 root.location = (0.0, 0.0, 0.0)
             except Exception:
                 pass
@@ -205,6 +402,7 @@ class KSPMU_OT_MuBrowserImportPart(bpy.types.Operator):
 classes_to_register = (
     KSPMU_OT_MuBrowserRefresh,
     KSPMU_OT_MuBrowserGenThumbs,
+    KSPMU_OT_MuBrowserRegenThumbs,
     KSPMU_OT_MuBrowserSelect,
     KSPMU_OT_MuBrowserImportPart,
 )
