@@ -13,6 +13,9 @@
 
 Blender 5.0 removed legacy ``action.fcurves``; FCurves live in layered
 channelbags. Prefer ``fcurve_ensure_for_datablock`` when creating keys.
+
+Also stores MuClip / MuCurve wrap modes and MuAnimation.autoPlay as
+IDProperties on Actions so import → edit → export is non-destructive.
 """
 
 import bpy
@@ -79,8 +82,7 @@ def fcurve_new(action, datablock, data_path, index=0):
         return action.fcurves.new(data_path=data_path, index=index)
     # Blender 5.x
     ensure_action_assigned(datablock, action)
-    return action.fcurve_ensure_for_datablock(
-        datablock, data_path, index=index)
+    return action.fcurve_ensure_for_datablock(datablock, data_path, index=index)
 
 
 def push_action_to_nla(obj, action, track_name):
@@ -120,3 +122,461 @@ def push_action_to_nla(obj, action, track_name):
         except Exception:
             pass
     return track, strip
+
+
+# Unity WrapMode values used by MuClip / MuCurve
+MU_WRAP_DEFAULT = 0
+MU_WRAP_ONCE = 1
+MU_WRAP_LOOP = 2
+MU_WRAP_PINGPONG = 4
+MU_WRAP_CLAMP = 8
+
+MU_WRAP_NAMES = {
+    0: "Default",
+    1: "Once",
+    2: "Loop",
+    4: "Ping-Pong",
+    8: "Clamp",
+}
+
+
+def mu_wrap_name(mode):
+    try:
+        return MU_WRAP_NAMES.get(int(mode), f"Unknown({mode})")
+    except Exception:
+        return "Unknown"
+
+
+def _curve_key(data_path, index):
+    safe = str(data_path).replace("\\", "\\\\").replace("|", "\\|")
+    return f"mu_curve_wrap|{safe}|{int(index)}"
+
+
+def _curve_key_old(data_path, index):
+    safe = str(data_path).replace("\\", "\\\\").replace("|", "\\|")
+    return f"mu_curve_wrap:{safe}:{int(index)}"
+
+
+def set_mu_curve_wrap(action, fcurve, pre_mode, post_mode):
+    """Store MuCurve.wrapMode (pre, post) on the Action as an IDProperty."""
+    if action is None or fcurve is None:
+        return
+    try:
+        pre_mode = int(pre_mode)
+        post_mode = int(post_mode)
+    except Exception:
+        pre_mode = MU_WRAP_CLAMP
+        post_mode = MU_WRAP_CLAMP
+    action[_curve_key(fcurve.data_path, fcurve.array_index)] = f"{pre_mode},{post_mode}"
+
+
+def get_mu_curve_wrap(action, fcurve):
+    """Return (pre, post) wrap modes stored on Action for this FCurve."""
+    if action is None or fcurve is None:
+        return MU_WRAP_CLAMP, MU_WRAP_CLAMP
+    key = _curve_key(fcurve.data_path, fcurve.array_index)
+    old_key = _curve_key_old(fcurve.data_path, fcurve.array_index)
+    value = action.get(key, action.get(old_key))
+    if value is None:
+        return MU_WRAP_CLAMP, MU_WRAP_CLAMP
+    try:
+        if isinstance(value, str):
+            a, b = value.split(",", 1)
+            return int(a), int(b)
+        if isinstance(value, (tuple, list)):
+            return int(value[0]), int(value[1])
+    except Exception:
+        pass
+    return MU_WRAP_CLAMP, MU_WRAP_CLAMP
+
+
+def _remove_mu_curve_modifiers(fcurve):
+    for modifier in list(fcurve.modifiers):
+        try:
+            if modifier.get("mu_curve_wrap_modifier"):
+                fcurve.modifiers.remove(modifier)
+        except Exception:
+            pass
+
+
+def apply_mu_curve_wrap(action, fcurve, pre_mode, post_mode):
+    """Store MuCurve.wrapMode and mirror Loop/PingPong with a Cycles modifier."""
+    try:
+        pre_mode = int(pre_mode)
+        post_mode = int(post_mode)
+    except Exception:
+        pre_mode = MU_WRAP_CLAMP
+        post_mode = MU_WRAP_CLAMP
+
+    set_mu_curve_wrap(action, fcurve, pre_mode, post_mode)
+    _remove_mu_curve_modifiers(fcurve)
+    fcurve.extrapolation = 'CONSTANT'
+
+    before = 'NONE'
+    after = 'NONE'
+    if pre_mode == MU_WRAP_LOOP:
+        before = 'REPEAT'
+    elif pre_mode == MU_WRAP_PINGPONG:
+        before = 'MIRROR'
+    if post_mode == MU_WRAP_LOOP:
+        after = 'REPEAT'
+    elif post_mode == MU_WRAP_PINGPONG:
+        after = 'MIRROR'
+    if before == 'NONE' and after == 'NONE':
+        return
+    modifier = fcurve.modifiers.new(type='CYCLES')
+    modifier.mode_before = before
+    modifier.mode_after = after
+    try:
+        modifier["mu_curve_wrap_modifier"] = 1
+    except Exception:
+        pass
+
+
+def iter_export_keyframes(action, fcurve):
+    """Yield keyframe-like objects for .mu export (original keys if Ping-Pong baked).
+
+    Always prefer a stored backup when present — even if mu_pp_baked was
+    already cleared — so viewport bake can never reach the .mu file.
+    """
+    class _K:
+        __slots__ = ("co", "handle_left", "handle_right")
+    if action is not None:
+        key = "mu_pp_backup|%s|%d" % (fcurve.data_path, fcurve.array_index)
+        raw = action.get(key)
+        if raw:
+            try:
+                import json
+                pts = json.loads(raw) if isinstance(raw, str) else list(raw)
+                for pt in pts:
+                    k = _K()
+                    k.co = (float(pt[0]), float(pt[1]))
+                    if len(pt) >= 6:
+                        k.handle_left = (float(pt[2]), float(pt[3]))
+                        k.handle_right = (float(pt[4]), float(pt[5]))
+                    else:
+                        k.handle_left = (k.co[0] - 1.0, k.co[1])
+                        k.handle_right = (k.co[0] + 1.0, k.co[1])
+                    yield k
+                return
+            except Exception:
+                pass
+    for kp in fcurve.keyframe_points:
+        yield kp
+
+
+
+def read_mu_clip_wrap(action):
+    """Read MuClip.wrapMode from Action; only 1/2/4/8. Default Once(1)."""
+    if action is None:
+        return MU_WRAP_ONCE
+    try:
+        v = action.get("mu_clip_wrap_mode", MU_WRAP_ONCE)
+    except Exception:
+        v = MU_WRAP_ONCE
+    try:
+        v = int(v)
+    except Exception:
+        v = MU_WRAP_ONCE
+    if v == MU_WRAP_DEFAULT:
+        v = MU_WRAP_ONCE
+    if v not in (MU_WRAP_ONCE, MU_WRAP_LOOP, MU_WRAP_PINGPONG, MU_WRAP_CLAMP):
+        v = MU_WRAP_ONCE
+    return v
+
+
+def restore_all_pingpong_for_export():
+    """Restore original keys on every Ping-Pong-baked Action (export safety).
+
+    Viewport bake must never reach the .mu file. wrapMode stays on the Action.
+    Backups are cleared only when every FCurve restored successfully — otherwise
+    keep them so iter_export_keyframes can still emit the original keys.
+    """
+    for action in bpy.data.actions:
+        try:
+            if not action.get("mu_pp_baked"):
+                continue
+        except Exception:
+            continue
+        all_ok = True
+        for fc in iter_action_fcurves(action):
+            if not _restore_fcurve_from_backup(action, fc):
+                # No backup or restore failed for this curve — keep going but
+                # do not drop remaining backups for the whole Action.
+                all_ok = False
+        try:
+            if "mu_pp_baked" in action:
+                del action["mu_pp_baked"]
+        except Exception:
+            pass
+        if not all_ok:
+            continue
+        # Clear backups so a later Ping-Pong click re-bakes cleanly
+        try:
+            for k in list(action.keys()):
+                if isinstance(k, str) and k.startswith("mu_pp_backup|"):
+                    del action[k]
+        except Exception:
+            pass
+
+
+def _strip_clip_helpers(fcurve):
+    """Remove clip-level CYCLES helpers (Loop / Ping-Pong)."""
+    for modifier in list(fcurve.modifiers):
+        try:
+            if modifier.get("mu_clip_pingpong") or modifier.get("mu_clip_loop"):
+                fcurve.modifiers.remove(modifier)
+        except Exception:
+            pass
+
+
+def _restore_fcurve_from_backup(action, fcurve):
+    """Restore keyframes saved before Ping-Pong bake (if any)."""
+    key = "mu_pp_backup|%s|%d" % (fcurve.data_path, fcurve.array_index)
+    raw = action.get(key) if action is not None else None
+    if not raw:
+        return False
+    try:
+        import json
+        pts = json.loads(raw) if isinstance(raw, str) else raw
+        fcurve.keyframe_points.clear()
+        if not pts:
+            return True
+        fcurve.keyframe_points.add(len(pts))
+        for i, pt in enumerate(pts):
+            kp = fcurve.keyframe_points[i]
+            kp.co = (float(pt[0]), float(pt[1]))
+            if len(pt) >= 6:
+                kp.handle_left = (float(pt[2]), float(pt[3]))
+                kp.handle_right = (float(pt[4]), float(pt[5]))
+            else:
+                t, v = float(pt[0]), float(pt[1])
+                kp.handle_left = (t - 1.0, v)
+                kp.handle_right = (t + 1.0, v)
+            kp.handle_left_type = 'FREE'
+            kp.handle_right_type = 'FREE'
+        fcurve.update()
+        return True
+    except Exception:
+        return False
+
+
+def _backup_fcurve_keys(action, fcurve):
+    key = "mu_pp_backup|%s|%d" % (fcurve.data_path, fcurve.array_index)
+    if action is None or key in action:
+        return
+    try:
+        import json
+        pts = []
+        for kp in fcurve.keyframe_points:
+            pts.append([
+                float(kp.co[0]), float(kp.co[1]),
+                float(kp.handle_left[0]), float(kp.handle_left[1]),
+                float(kp.handle_right[0]), float(kp.handle_right[1]),
+            ])
+        action[key] = json.dumps(pts)
+    except Exception:
+        pass
+
+
+def _action_key_range(action):
+    """Return (fmin, fmax) over all keyframes on action, or (None, None)."""
+    fmin = fmax = None
+    for fc in iter_action_fcurves(action):
+        for kp in fc.keyframe_points:
+            f = float(kp.co[0])
+            fmin = f if fmin is None else min(fmin, f)
+            fmax = f if fmax is None else max(fmax, f)
+    return fmin, fmax
+
+
+def _sync_strip_to_action_range(strip, action):
+    """Make NLA strip play the full Action range (needed after Ping-Pong bake)."""
+    if strip is None or action is None:
+        return
+    fmin, fmax = _action_key_range(action)
+    if fmin is None or fmax is None or fmax <= fmin:
+        return
+    try:
+        strip.action_frame_start = fmin
+        strip.action_frame_end = fmax
+    except Exception:
+        pass
+    try:
+        # Keep strip anchored at its current start; extend end to full duration
+        start = float(strip.frame_start)
+        strip.frame_end = start + (fmax - fmin)
+    except Exception:
+        pass
+
+
+def _bake_pingpong_keys(action, fcurve):
+    """Append a reversed copy of keys so one Action cycle is forward+back.
+
+    NLA strip.repeat always plays the Action forward; without baking the
+    reverse into keys, 'Ping-Pong' is just a long forward Loop.
+    """
+    kps = list(fcurve.keyframe_points)
+    if len(kps) < 2:
+        return
+    _backup_fcurve_keys(action, fcurve)
+    pts = [(float(kp.co[0]), float(kp.co[1])) for kp in kps]
+    t0, t1 = pts[0][0], pts[-1][0]
+    if (t1 - t0) <= 1e-6:
+        return
+    out = list(pts)
+    for t, v in reversed(pts[:-1]):
+        out.append((t1 + (t1 - t), v))
+    fcurve.keyframe_points.clear()
+    fcurve.keyframe_points.add(len(out))
+    for i, (t, v) in enumerate(out):
+        kp = fcurve.keyframe_points[i]
+        kp.co = (t, v)
+        kp.handle_left_type = 'AUTO_CLAMPED'
+        kp.handle_right_type = 'AUTO_CLAMPED'
+    try:
+        fcurve.update()
+    except Exception:
+        pass
+
+
+def _clear_pp_backups(action):
+    """Remove all mu_pp_backup|* IDProperties from action."""
+    if action is None:
+        return
+    try:
+        for k in list(action.keys()):
+            if isinstance(k, str) and k.startswith("mu_pp_backup|"):
+                del action[k]
+    except Exception:
+        pass
+
+
+def _apply_strip_repeat(strip, wrap_mode):
+    """Set NLA strip repeat / cyclic flags for the given Unity wrap mode."""
+    if strip is None:
+        return
+    if wrap_mode in (MU_WRAP_LOOP, MU_WRAP_PINGPONG):
+        strip.repeat = 1000.0
+    else:
+        strip.repeat = 1.0
+    strip.use_animated_time = False
+    try:
+        strip.use_animated_time_cyclic = False
+    except Exception:
+        pass
+
+
+def _apply_loop_curve_modifiers(action):
+    """Add CYCLES REPEAT helpers on curves that have no per-curve wrap override."""
+    if action is None:
+        return
+    for fc in iter_action_fcurves(action):
+        pre, post = get_mu_curve_wrap(action, fc)
+        if pre == MU_WRAP_CLAMP and post == MU_WRAP_CLAMP:
+            fc.extrapolation = 'CONSTANT'
+            mod = fc.modifiers.new(type='CYCLES')
+            mod.mode_before = 'REPEAT'
+            mod.mode_after = 'REPEAT'
+            try:
+                mod["mu_clip_loop"] = 1
+            except Exception:
+                pass
+
+
+def apply_mu_clip_wrap_to_strip(strip, wrap_mode):
+    """Apply MuClip.wrapMode to an NLA strip and store it on the Action.
+
+    Loop: long NLA repeat (Unity WrapMode.Loop — infinite).
+    Ping-Pong: bake one forth+back period, then long NLA repeat
+               (Unity WrapMode.PingPong — infinite, like Loop but alternating).
+               NLA shows repeat dividers between periods (same as Loop).
+    Once / Clamp / Default: single play.
+
+    Switching AWAY from Ping-Pong fully restores original keys, clears the
+    bake flag + backups, and resyncs the NLA strip to the short range so the
+    cloned reverse half does not remain visible in the Graph/NLA editors.
+
+    Strip repeat and Loop CYCLES modifiers are always applied LAST so that
+    Ping-Pong → Loop does not leave the strip looking like Once.
+    """
+    try:
+        wrap_mode = int(wrap_mode)
+    except Exception:
+        wrap_mode = MU_WRAP_ONCE
+    if wrap_mode == MU_WRAP_DEFAULT:
+        wrap_mode = MU_WRAP_ONCE
+
+    action = getattr(strip, "action", None)
+    if action is not None:
+        try:
+            if wrap_mode == MU_WRAP_DEFAULT:
+                wrap_mode = MU_WRAP_ONCE
+            if wrap_mode not in (MU_WRAP_ONCE, MU_WRAP_LOOP, MU_WRAP_PINGPONG, MU_WRAP_CLAMP):
+                wrap_mode = MU_WRAP_ONCE
+            action["mu_clip_wrap_mode"] = int(wrap_mode)
+        except Exception:
+            pass
+
+    if action is None:
+        _apply_strip_repeat(strip, wrap_mode)
+        return
+
+    was_baked = bool(action.get("mu_pp_baked"))
+    for fc in iter_action_fcurves(action):
+        _strip_clip_helpers(fc)
+        if was_baked and wrap_mode != MU_WRAP_PINGPONG:
+            _restore_fcurve_from_backup(action, fc)
+
+    if wrap_mode == MU_WRAP_PINGPONG:
+        for fc in iter_action_fcurves(action):
+            if not was_baked:
+                _bake_pingpong_keys(action, fc)
+        try:
+            action["mu_pp_baked"] = 1
+        except Exception:
+            pass
+        _sync_strip_to_action_range(strip, action)
+    elif was_baked and wrap_mode != MU_WRAP_PINGPONG:
+        try:
+            if "mu_pp_baked" in action:
+                del action["mu_pp_baked"]
+        except Exception:
+            pass
+        _clear_pp_backups(action)
+        _sync_strip_to_action_range(strip, action)
+
+    # ALWAYS re-apply strip repeat + Loop modifiers after key restore/bake.
+    # Previously Ping-Pong→Loop could leave repeat/modifiers looking like Once
+    # until the user clicked Loop a second time.
+    _apply_strip_repeat(strip, wrap_mode)
+    if wrap_mode == MU_WRAP_LOOP:
+        _apply_loop_curve_modifiers(action)
+
+
+def apply_mu_clip_wrap_to_action(action, wrap_mode):
+    """Store MuClip.wrapMode on Action and update every NLA strip using it."""
+    try:
+        wrap_mode = int(wrap_mode)
+    except Exception:
+        wrap_mode = MU_WRAP_ONCE
+    if wrap_mode == MU_WRAP_DEFAULT:
+        wrap_mode = MU_WRAP_ONCE
+
+    if wrap_mode == MU_WRAP_DEFAULT:
+        wrap_mode = MU_WRAP_ONCE
+    if wrap_mode not in (MU_WRAP_ONCE, MU_WRAP_LOOP, MU_WRAP_PINGPONG, MU_WRAP_CLAMP):
+        wrap_mode = MU_WRAP_ONCE
+    try:
+        action["mu_clip_wrap_mode"] = int(wrap_mode)
+    except Exception:
+        pass
+
+    for id_data in list(bpy.data.objects) + list(bpy.data.materials):
+        ad = getattr(id_data, "animation_data", None)
+        if not ad:
+            continue
+        for track in ad.nla_tracks:
+            for strip in track.strips:
+                if strip.action == action:
+                    apply_mu_clip_wrap_to_strip(strip, wrap_mode)

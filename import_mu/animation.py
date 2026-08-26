@@ -24,10 +24,18 @@ import math
 from mathutils import Vector, Quaternion
 from math import pi
 from .light import light_power
-from ..utils.action_compat import fcurve_new, push_action_to_nla
+from ..utils.action_compat import (
+    fcurve_new, push_action_to_nla, apply_mu_curve_wrap, apply_mu_clip_wrap_to_strip, mu_wrap_name,
+)
 
 #mess with the heads of 6.28... fans :P
 tau = pi / 180
+
+# Collected during create_action; printed once at end of import (no timer spam)
+MU_IMPORT_CLIPS = []
+MU_IMPORT_GENERATION = 0
+_MU_SUMMARY_DONE_GEN = -1
+
 
 property_map = {
     "m_LocalPosition.x": ("obj", "location", 0, 1, 3),
@@ -722,6 +730,15 @@ def create_action(mu, path, clip, host=None):
         fcurve = create_fcurve(act, curve, fullpropmap, obj, rest_value=rest_value)
         if fcurve is None:
             continue
+        # Preserve MuCurve.wrapMode (pre, post) for non-destructive export
+        try:
+            wm = getattr(curve, "wrapMode", None)
+            if wm is not None:
+                pre = int(wm[0]) if isinstance(wm, (tuple, list)) else int(wm)
+                post = int(wm[1]) if isinstance(wm, (tuple, list)) and len(wm) > 1 else pre
+                apply_mu_curve_wrap(act, fcurve, pre, post)
+        except Exception:
+            pass
         # Only transform channels (location/rotation/scale) carry a 4th
         # "component count" entry. Light/material props are shorter tuples —
         # never feed them into bone-space fcurve rebasing (turboJet crash).
@@ -843,6 +860,52 @@ def create_action(mu, path, clip, host=None):
                   % (getattr(muobj, "path", "?"),))
         except Exception:
             pass
+    # MuAnimation component metadata (autoPlay + selected clip name)
+    mu_anim = getattr(host, "animation", None) if host is not None else None
+    auto_play = 0
+    selected_clip = ""
+    if mu_anim is not None:
+        try:
+            auto_play = int(bool(getattr(mu_anim, "autoPlay", False)))
+        except Exception:
+            auto_play = 0
+        try:
+            selected_clip = str(getattr(mu_anim, "clip", "") or "")
+        except Exception:
+            selected_clip = ""
+    host_bobj = getattr(host, "bobj", None) if host is not None else None
+    if host_bobj is not None:
+        try:
+            host_bobj["mu_animation_autoplay"] = auto_play
+            host_bobj["mu_animation_clip"] = selected_clip
+            host_bobj["mu_animation_host"] = path
+        except Exception:
+            pass
+
+    wrap_mode = 1
+    try:
+        wrap_mode = int(getattr(clip, "wrapMode", 1))
+    except Exception:
+        wrap_mode = 1
+    if wrap_mode == 0:  # Unity Default → Once for UI / NLA
+        wrap_mode = 1
+    # Only legal Unity clip wrap modes; anything else (e.g. stream corruption
+    # from a previous bad export) falls back to Once so we do not bake Ping-Pong
+    # onto every clip and destroy keys.
+    if wrap_mode not in (1, 2, 4, 8):
+        wrap_mode = 1
+
+    # Registry for a single compact console line at end of import
+    try:
+        MU_IMPORT_CLIPS.append({
+            "name": str(clip.name),
+            "auto_play": int(auto_play),
+            "wrap": int(wrap_mode),
+            "host": str(path or ""),
+        })
+    except Exception:
+        pass
+
     for name in actions:
         act, obj = actions[name]
         # Remember which Mu hierarchy node owned this Animation component so
@@ -850,6 +913,17 @@ def create_action(mu, path, clip, host=None):
         try:
             act["mu_anim_host"] = path
             act["mu_clip_name"] = clip.name
+            # Isolated per Action — never shared across clips/hosts
+            wm = int(wrap_mode)
+            if wm == 0:
+                wm = 1
+            if wm not in (1, 2, 4, 8):
+                wm = 1
+            act["mu_clip_wrap_mode"] = wm
+            act["mu_auto_play"] = int(auto_play)
+            act["mu_import_gen"] = int(MU_IMPORT_GENERATION)
+            if selected_clip:
+                act["mu_animation_clip"] = selected_clip
         except Exception:
             pass
         # Unique Blender object name — required when siblings share a Unity
@@ -860,10 +934,31 @@ def create_action(mu, path, clip, host=None):
                 act["mu_anim_bobj"] = bobj.name
         except Exception:
             pass
-        track, _strip = push_action_to_nla(obj, act, clip.name)
+        try:
+            act["mu_nla_owner"] = obj.name
+        except Exception:
+            pass
+        track, strip = push_action_to_nla(obj, act, clip.name)
+        if strip is not None:
+            apply_mu_clip_wrap_to_strip(strip, wrap_mode)
+        # Re-assert wrap after apply (Ping-Pong bake must not alter stored mode)
+        try:
+            wm = int(wrap_mode)
+            if wm == 0:
+                wm = 1
+            if wm not in (1, 2, 4, 8):
+                wm = 1
+            act["mu_clip_wrap_mode"] = wm
+        except Exception:
+            pass
         # NlaTrack may not support IDProperties (Blender 5); Action holds host.
 
 def create_object_paths(mu):
+    # New import batch — reset console summary registry
+    global MU_IMPORT_CLIPS, MU_IMPORT_GENERATION
+    MU_IMPORT_CLIPS = []
+    MU_IMPORT_GENERATION += 1
+
     def recurse (mu, obj, parent_names, parent):
         obj.parent = parent
         obj.mu = mu
@@ -914,11 +1009,98 @@ def ordered_clip_names(names):
     return sorted(uniq, key=lambda n: (_preview_clip_score(n), uniq.index(n)))
 
 
+def _mu_int(val, default=0):
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
+def print_mu_animation_summary(force=False):
+    """Compact one-liner of every Action created in this import generation.
+
+    Counts distinct Actions tagged with mu_import_gen (matches NLA tracks),
+    not just create_action host calls. Only force=True prints (no timer spam).
+
+    Identical (name, AP, WM) groups are collapsed: ``antenna=2 AP=yes WM=Once``.
+    """
+    global _MU_SUMMARY_DONE_GEN
+    if not force:
+        return
+    try:
+        gen = int(MU_IMPORT_GENERATION)
+        if gen == int(_MU_SUMMARY_DONE_GEN):
+            return
+        # Ordered groups: (short_name, ap, wm) → count
+        from collections import OrderedDict
+        groups = OrderedDict()
+        seen = set()
+        total = 0
+
+        def _add(name, ap, wm):
+            nonlocal total
+            short = name if len(name) <= 12 else name[:12]
+            key = (short, ap, wm)
+            groups[key] = groups.get(key, 0) + 1
+            total += 1
+
+        for act in bpy.data.actions:
+            try:
+                if int(act.get("mu_import_gen", -1)) != gen:
+                    continue
+            except Exception:
+                continue
+            ptr = act.as_pointer()
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            try:
+                name = str(act.get("mu_clip_name") or act.name or "?")
+            except Exception:
+                name = act.name or "?"
+            try:
+                ap = "yes" if int(act.get("mu_auto_play", 0) or 0) else "no"
+            except Exception:
+                ap = "no"
+            try:
+                wm = mu_wrap_name(int(act.get("mu_clip_wrap_mode", 1) or 1))
+            except Exception:
+                wm = "?"
+            _add(name, ap, wm)
+
+        if not groups:
+            reg_seen = set()
+            for c in list(MU_IMPORT_CLIPS):
+                key = (c.get("host") or "", c.get("name") or "")
+                if key in reg_seen:
+                    continue
+                reg_seen.add(key)
+                name = str(c.get("name") or "?")
+                ap = "yes" if c.get("auto_play") else "no"
+                wm = mu_wrap_name(int(c.get("wrap") or 1))
+                _add(name, ap, wm)
+
+        if groups:
+            parts = []
+            for (short, ap, wm), cnt in groups.items():
+                if cnt > 1:
+                    parts.append("%s=%d AP=%s WM=%s" % (short, cnt, ap, wm))
+                else:
+                    parts.append("%s AP=%s WM=%s" % (short, ap, wm))
+            print("INFO: Anim=%d | %s" % (total, " | ".join(parts)))
+        _MU_SUMMARY_DONE_GEN = gen
+    except Exception as e:
+        print("WARN: MU anim summary failed: %s" % (e,))
+
+
 def finalize_animation_preview():
     """Blender 5 keeps the last pushed Action as ``ad.action``.
 
-    Clear the active Action and unmute the best preview clip (prefer Deploy /
-    stowed at ``frame_start``), mute the rest (e.g. Drill_Running).
+    Clear the active Action and unmute the best preview clip. Prefer the
+    MuAnimation selected clip when autoPlay is set, otherwise Deploy/stowed
+    heuristic. Mute the rest (e.g. Drill_Running).
+
+    Animation console summary prints once at the end of finalize.
     """
     try:
         bpy.context.scene.frame_set(int(bpy.context.scene.frame_start))
@@ -932,7 +1114,26 @@ def finalize_animation_preview():
         names = [t.name for t in ad.nla_tracks if t.name]
         if not names:
             return
-        keep = ordered_clip_names(names)[0]
+        # Prefer MuAnimation selected clip / autoPlay when present
+        keep = None
+        autoplay_clip = None
+        component_clip = None
+        for track in ad.nla_tracks:
+            for strip in track.strips:
+                act = strip.action
+                if act is None:
+                    continue
+                cname = act.get("mu_clip_name", track.name)
+                if act.get("mu_animation_clip"):
+                    component_clip = str(act["mu_animation_clip"])
+                if int(act.get("mu_auto_play", 0) or 0):
+                    autoplay_clip = cname
+        if autoplay_clip and autoplay_clip in names:
+            keep = autoplay_clip
+        elif component_clip and component_clip in names:
+            keep = component_clip
+        if not keep:
+            keep = ordered_clip_names(names)[0]
         for track in ad.nla_tracks:
             track.mute = (track.name != keep)
         try:
@@ -944,6 +1145,31 @@ def finalize_animation_preview():
         _finalize(obj)
     for mat in bpy.data.materials:
         _finalize(mat)
+
+    # Optional: start playback when any clip has autoPlay
+    has_autoplay = False
+    for act in bpy.data.actions:
+        if _mu_int(act.get("mu_auto_play", 0), 0):
+            has_autoplay = True
+            break
+    if has_autoplay:
+        def _start_animation():
+            try:
+                for window in bpy.context.window_manager.windows:
+                    screen = window.screen
+                    if screen is None:
+                        continue
+                    with bpy.context.temp_override(window=window, screen=screen):
+                        if not screen.is_animation_playing:
+                            bpy.ops.screen.animation_play()
+                        return None
+            except Exception as e:
+                print(f"WARNING: Could not start MU Auto Play: {e}")
+            return None
+        try:
+            bpy.app.timers.register(_start_animation, first_interval=0.25)
+        except Exception:
+            pass
     # Engine / heat: restore EmissionMap (undo white-bypass) + soft blackbody
     try:
         from ..shader.shader import (
@@ -975,3 +1201,9 @@ def finalize_animation_preview():
                     enhance_heat_blackbody_preview(mat)
                 except Exception:
                     pass
+
+    # Console summary once per import generation (idempotent)
+    try:
+        print_mu_animation_summary(force=True)
+    except Exception as e:
+        print("WARN: MU anim summary failed: %s" % (e,))

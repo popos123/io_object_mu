@@ -26,7 +26,7 @@ from mathutils import Vector, Quaternion
 
 from ..mu import MuAnimation, MuClip, MuCurve, MuKey
 from ..utils import strip_nnn
-from ..utils.action_compat import iter_action_fcurves
+from ..utils.action_compat import iter_action_fcurves, get_mu_curve_wrap, iter_export_keyframes, read_mu_clip_wrap, restore_all_pingpong_for_export
 
 from .light import light_types, light_power
 
@@ -111,9 +111,10 @@ def shader_animations(mat, path):
                 name = action["mu_clip_name"]
         except Exception:
             pass
-        if name not in animations:
-            animations[name] = []
-        animations[name].append((track_or_action, path, mat))
+        dkey = _clip_dict_key(name, path, action)
+        if dkey not in animations:
+            animations[dkey] = []
+        animations[dkey].append((track_or_action, path, mat))
 
     for track in mat.animation_data.nla_tracks:
         add_track(track, track.name)
@@ -123,6 +124,53 @@ def shader_animations(mat, path):
         clip = act.get("mu_clip_name") if hasattr(act, "get") else None
         add_track(act, clip or act.name)
     return animations
+
+def _clip_dict_key(clip_name, path, action=None):
+    """Unique dict key so sibling hosts sharing a clip name stay separate.
+
+    MuClip.name written to .mu is still the plain clip_name; the suffix is
+    only used while collecting/exporting so wrapMode cannot bleed across
+    orange-empty hosts (four antennas all named \"antenna\").
+    """
+    host_tag = ""
+    if action is not None:
+        try:
+            host_tag = (action.get("mu_anim_bobj")
+                        or action.get("mu_nla_owner")
+                        or action.get("mu_anim_host")
+                        or "")
+        except Exception:
+            host_tag = ""
+        if not host_tag:
+            try:
+                if "mu_anim_bobj" in action:
+                    host_tag = action["mu_anim_bobj"]
+                elif "mu_nla_owner" in action:
+                    host_tag = action["mu_nla_owner"]
+                elif "mu_anim_host" in action:
+                    host_tag = action["mu_anim_host"]
+            except Exception:
+                pass
+    if not host_tag:
+        host_tag = path or ""
+    # Action pointer makes the key unique even when tags are missing/duplicate
+    ap = ""
+    try:
+        if action is not None:
+            ap = str(action.as_pointer())
+    except Exception:
+        pass
+    return "%s\x00%s\x00%s" % (clip_name, host_tag, ap)
+
+
+def _clip_name_from_key(key):
+    """Extract the real MuClip name from a composite collection key."""
+    if not key:
+        return key
+    if "\x00" in key:
+        return key.split("\x00", 1)[0]
+    return key
+
 
 def object_animations(obj, path):
     animations = {}
@@ -138,19 +186,22 @@ def object_animations(obj, path):
                 continue
             if track.strips:
                 # Multiple NLA tracks can share a clip name (one Action per
-                # animated target created at import). Collect ALL of them.
+                # animated target created at import). Collect ALL of them —
+                # keyed by (clip_name, host, action) so siblings stay separate.
                 strip_act = track.strips[0].action
                 if _is_fx_preview_anim(strip_act):
                     continue
-                if track.name not in animations:
-                    animations[track.name] = []
-                animations[track.name].append((track, path, typ))
+                key = _clip_dict_key(track.name, path, strip_act)
+                if key not in animations:
+                    animations[key] = []
+                animations[key].append((track, path, typ))
         # if nla_tracks exist, then action will be an nla track that has been
         # opened for tweaking, so export action only if there are no nla tracks
         if not animations and obj.animation_data.action:
             action = obj.animation_data.action
             if not _is_fx_preview_anim(action):
-                animations[action.name] = [(action, path, typ)]
+                key = _clip_dict_key(action.name, path, action)
+                animations[key] = [(action, path, typ)]
     return animations
 
 def extend_animations(animations, anims):
@@ -289,8 +340,10 @@ def _anim_host_of(track_or_action, fallback_path):
     """Return host key for grouping MuAnimation clips.
 
     Prefers ``mu_anim_bobj`` (unique Blender object name) so duplicate Unity
-    sibling names (RCSBlock×4 RCSthruster) do not collapse to one host.
-    Falls back to ``mu_anim_host`` path string.
+    sibling names (RCSBlock×4 RCSthruster / antenna×4) do not collapse to
+    one host. Then ``mu_anim_host`` path, then ``mu_nla_owner``, then the
+    full entry path (never only the first hierarchy segment — that merged
+    sibling antennas and forced a single shared wrapMode).
     Returns ``("bobj", name)`` or ``("path", path)``.
     """
     try:
@@ -308,22 +361,39 @@ def _anim_host_of(track_or_action, fallback_path):
             except Exception:
                 pass
             try:
-                if "mu_anim_host" in action and action["mu_anim_host"]:
-                    return ("path", action["mu_anim_host"])
+                host_path = action.get("mu_anim_host") if hasattr(action, "get") else None
+                if not host_path and "mu_anim_host" in action:
+                    host_path = action["mu_anim_host"]
+                if host_path:
+                    return ("path", str(host_path))
+            except Exception:
+                pass
+            try:
+                nla_owner = action.get("mu_nla_owner") if hasattr(action, "get") else None
+                if not nla_owner and "mu_nla_owner" in action:
+                    nla_owner = action["mu_nla_owner"]
+                if nla_owner:
+                    return ("bobj", str(nla_owner))
             except Exception:
                 pass
     except (TypeError, KeyError, IndexError, AttributeError):
         pass
-    return ("path", fallback_path)
+    # Full path — not path.split("/")[0] — so siblings stay separate hosts
+    return ("path", fallback_path if fallback_path else "")
 
 
 def group_animations_by_host(animations, default_root):
-    """Split collected animations into per-host groups for nested MuAnimation."""
+    """Split collected animations into per-host groups for nested MuAnimation.
+
+    Each distinct Animation host (sibling antennas etc.) gets its own group so
+    identical clip names keep independent wrapMode values.
+    """
     groups = {}
     for clip_name, entries in animations.items():
         for entry in entries:
             track, path, typ = entry
-            host = _anim_host_of(track, default_root or path.split("/")[0])
+            # Prefer full entry path as fallback so siblings do not share a host key
+            host = _anim_host_of(track, path or default_root or "")
             if host not in groups:
                 groups[host] = {}
             if clip_name not in groups[host]:
@@ -376,9 +446,16 @@ def make_curve(mu, muobj, curve, path, typ, action=None, anim_root=None):
             mucurve.path = path
             mucurve.property = property
             mucurve.type = ctyp
-            mucurve.wrapMode = (8, 8)
+            wm = get_mu_curve_wrap(action, curve) if action is not None else (8, 8)
+            # MuCurve.wrapMode must be exactly two ints (pre, post) — otherwise
+            # the binary stream shifts and later MuClip.wrapMode values are
+            # misread (commonly as Ping-Pong=4) and keys become garbage.
+            try:
+                mucurve.wrapMode = (int(wm[0]), int(wm[1]))
+            except Exception:
+                mucurve.wrapMode = (8, 8)
             mucurve.keys = []
-            for key in curve.keyframe_points:
+            for key in iter_export_keyframes(action, curve):
                 mucurve.keys.append(make_key(key, mult))
             return mucurve
         if curve.data_path not in property_map:
@@ -467,9 +544,16 @@ def make_curve(mu, muobj, curve, path, typ, action=None, anim_root=None):
     mucurve.property = property
     # 0 = transform, 1 = material, 2 = light, 3 = audio source
     mucurve.type = ctyp
-    mucurve.wrapMode = (8, 8)
+    wm = get_mu_curve_wrap(action, curve) if action is not None else (8, 8)
+    # MuCurve.wrapMode must be exactly two ints (pre, post) — otherwise
+    # the binary stream shifts and later MuClip.wrapMode values are
+    # misread (commonly as Ping-Pong=4) and keys become garbage.
+    try:
+        mucurve.wrapMode = (int(wm[0]), int(wm[1]))
+    except Exception:
+        mucurve.wrapMode = (8, 8)
     mucurve.keys = []
-    for key in curve.keyframe_points:
+    for key in iter_export_keyframes(action, curve):
         mucurve.keys.append(make_key(key, mult))
     return mucurve
 
@@ -551,16 +635,63 @@ def transform_curves(muarm):
                         rotation[2].keys[i].tangent[j] = -tan.y
                         rotation[3].keys[i].tangent[j] = -tan.z
 
+def make_animations_per_host(mu, animations, default_root=""):
+    """Build one MuAnimation per distinct host (orange empty / Animation GO).
+
+    Sibling objects that share a clip name (e.g. four ``antenna`` clips) each
+    keep their own wrapMode. Returns list of ``(host_key, anim_root, MuAnimation)``.
+    Prefer this over a single ``make_animations`` call on the ungrouped dict.
+    """
+    groups = group_animations_by_host(animations, default_root)
+    out = []
+    for host_key, host_anims in groups.items():
+        if host_key[0] == "path":
+            root = host_key[1] or default_root or ""
+        else:
+            # bobj name → prefer mu_anim_host from any action in the group
+            root = default_root or ""
+            for entries in host_anims.values():
+                for track, path, typ in entries:
+                    action = track if isinstance(track, bpy.types.Action) else (
+                        track.strips[0].action if getattr(track, "strips", None) else None)
+                    if action is None:
+                        continue
+                    try:
+                        tagged = action.get("mu_anim_host") if hasattr(action, "get") else None
+                        if not tagged and "mu_anim_host" in action:
+                            tagged = action["mu_anim_host"]
+                        if tagged:
+                            root = str(tagged)
+                            break
+                    except Exception:
+                        pass
+                    if path:
+                        root = path
+                        break
+                if root:
+                    break
+        anim = make_animations(mu, host_anims, root)
+        if anim is not None and getattr(anim, "clips", None):
+            out.append((host_key, root, anim))
+    return out
+
+
 def make_animations(mu, animations, anim_root):
+    # Never write Ping-Pong viewport bake into .mu keys
+    restore_all_pingpong_for_export()
+
     anim = MuAnimation()
     anim.autoPlay = False
     default_clip_name = None
+    selected_clip_name = None
     clip_names = set()
-    
-    for clip_name in animations:
-        if clip_name in clip_names:
+
+    for dict_key in animations:
+        # dict_key may be composite "clip\\x00host\\x00ptr" — MuClip.name is plain
+        clip_name = _clip_name_from_key(dict_key)
+        if dict_key in clip_names:
             continue
-        clip_names.add(clip_name)
+        clip_names.add(dict_key)
         clip = MuClip()
         if default_clip_name is None:
             default_clip_name = clip_name
@@ -568,10 +699,14 @@ def make_animations(mu, animations, anim_root):
         clip.lbCenter = (0, 0, 0)
         clip.lbSize = (0, 0, 0)
         clip.wrapMode = 1
-        #print(f"Creating clip: {clip_name}") # Debug clip animations
-        
+        # Single-pass: only Actions that actually contribute curves vote for
+        # wrapMode. Sibling empties sharing clip name "antenna" must not bleed.
+        clip_action = None
+        wrap_votes = []
         seen_actions = set()
-        for data in animations[clip_name]:
+        contributed = False
+
+        for data in animations[dict_key]:
             track, path, typ = data
             # Normalize Blender-only segments (.skin / .bindPose / ∧nnn)
             norm = "/".join(
@@ -613,21 +748,47 @@ def make_animations(mu, animations, anim_root):
             if not muobj:
                 print(f"Object path not found: {path}")
                 continue
+
+            # Strict host filter: entry must belong to THIS anim_root host.
+            # Use orange-empty identity (mu_anim_bobj / mu_nla_owner / path),
+            # NOT a loose prefix match that pulls sibling antennas together.
+            host_key = _anim_host_of(track, path)
+            if anim_root:
+                belongs = False
+                if host_key[0] == "path" and host_key[1]:
+                    # Exact host path, or this entry IS the host object
+                    belongs = (host_key[1] == anim_root or path == anim_root)
+                elif host_key[0] == "bobj" and host_key[1]:
+                    try:
+                        action_tmp = track if isinstance(track, bpy.types.Action) else (
+                            track.strips[0].action if getattr(track, "strips", None) else None)
+                        tagged = None
+                        if action_tmp is not None:
+                            tagged = action_tmp.get("mu_anim_host") if hasattr(action_tmp, "get") else None
+                            if not tagged and "mu_anim_host" in action_tmp:
+                                tagged = action_tmp["mu_anim_host"]
+                        if tagged and str(tagged) == anim_root:
+                            belongs = True
+                        # Also accept when anim_root path ends with this bobj name
+                        if not belongs and anim_root.rstrip("/").endswith("/" + str(host_key[1])):
+                            belongs = True
+                        if not belongs and anim_root.rstrip("/").split("/")[-1] == str(host_key[1]):
+                            belongs = True
+                    except Exception:
+                        pass
+                if not belongs and path == anim_root:
+                    belongs = True
+                if not belongs:
+                    continue
+
             # Curve paths are relative to the Animation host (anim_root)
             if not anim_root or path == anim_root:
                 rel_path = ""
             elif path.startswith(anim_root + "/"):
                 rel_path = path[len(anim_root) + 1:]
             elif anim_root.startswith(path + "/"):
-                # anim_root is DEEPER than this entry's own recorded path
-                # (eg. a control armature's animation actually lives on a
-                # bone-child GameObject one or more hops below the armature's
-                # own path). The extra depth is handled by bone-path
-                # stripping in make_curve (against anim_root), so the outer
-                # prefix here must stay empty rather than re-adding it.
                 rel_path = ""
             else:
-                # Object is not under this host — keep path as-is (best effort)
                 rel_path = path
             action = track if isinstance(track, bpy.types.Action) else (
                 track.strips[0].action if getattr(track, "strips", None) else None)
@@ -645,6 +806,7 @@ def make_animations(mu, animations, anim_root):
                             curve_rel = action["mu_unity_curve_path"]
                     except Exception:
                         pass
+                n_before = len(clip.curves)
                 for curve in iter_action_fcurves(action):
                     curve_data = make_curve(
                         mu, muobj, curve, curve_rel, typ, action=action,
@@ -653,9 +815,34 @@ def make_animations(mu, animations, anim_root):
                         clip.curves.append(curve_data)
                 if hasattr(muobj, "animated_bones"):
                     transform_curves(muobj)
+                # Only actions that actually added curves may vote for wrapMode
+                if len(clip.curves) > n_before:
+                    contributed = True
+                    if clip_action is None:
+                        clip_action = action
+                    wrap_votes.append(read_mu_clip_wrap(action))
+
+        if wrap_votes:
+            from collections import Counter
+            clip.wrapMode = int(Counter(wrap_votes).most_common(1)[0][0])
+        if clip_action is not None:
+            try:
+                if int(clip_action.get("mu_auto_play", 0) or 0):
+                    anim.autoPlay = True
+                if selected_clip_name is None:
+                    value = clip_action.get("mu_animation_clip", "")
+                    if value:
+                        selected_clip_name = str(value)
+            except Exception:
+                pass
+        # Skip empty clips (all entries filtered out as other hosts)
+        if not contributed and not clip.curves:
+            continue
         anim.clips.append(clip)
-    
-    if default_clip_name:
+
+    if selected_clip_name:
+        anim.clip = selected_clip_name
+    elif default_clip_name:
         anim.clip = default_clip_name
     #print(f"Created animation: {anim}") # Debug animations
     return anim
