@@ -25,7 +25,7 @@ from math import pi
 from mathutils import Vector, Quaternion
 
 from ..mu import MuAnimation, MuClip, MuCurve, MuKey
-from ..utils import strip_nnn
+from ..utils import strip_nnn, normalize_mu_curve_path, unity_export_name
 from ..utils.action_compat import iter_action_fcurves, get_mu_curve_wrap, iter_export_keyframes, read_mu_clip_wrap, restore_all_pingpong_for_export
 
 from .light import light_types, light_power
@@ -229,9 +229,36 @@ def _host_autoplay_from_animations(animations, anim_root=""):
                     best = (score, ap)
             except Exception:
                 pass
-    if best is None:
-        return None
-    return best[1]
+    if best is not None:
+        return best[1]
+    # Hosts without an orange empty (eg. S6_SAW/Root P6_unlock) only store AP on Actions.
+    action_votes = []
+    for entries in animations.values():
+        for data in entries:
+            track, _path, _typ = data
+            action = track if isinstance(track, bpy.types.Action) else None
+            if action is None and not isinstance(track, bpy.types.Action):
+                try:
+                    strips = getattr(track, "strips", None)
+                    action = strips[0].action if strips else None
+                except Exception:
+                    action = None
+            if action is None or "mu_auto_play" not in action:
+                continue
+            try:
+                tagged = str(action.get("mu_anim_host") or "")
+            except Exception:
+                tagged = ""
+            if anim_root and tagged and tagged != anim_root:
+                continue
+            try:
+                action_votes.append(bool(int(action.get("mu_auto_play", 0) or 0)))
+            except Exception:
+                pass
+    if action_votes:
+        from collections import Counter
+        return bool(Counter(action_votes).most_common(1)[0][0])
+    return None
 
 
 def _merge_entries_by_clip_name(animations):
@@ -294,7 +321,7 @@ def _mu_export_path(obj, parent_path):
     into that same MuObject — keep the parent path so material clips resolve.
     """
     from .armature import is_bindpose_armature, bindpose_base_name
-    name = strip_nnn(obj.name)
+    name = unity_export_name(obj)
     if type(obj.data) == bpy.types.Armature and is_bindpose_armature(obj):
         seg = bindpose_base_name(obj)
     elif (name.endswith(".skin") and obj.parent
@@ -307,12 +334,53 @@ def _mu_export_path(obj, parent_path):
         return parent_path + "/" + seg
     return seg
 
+def bindpose_object_animations(obj, path):
+    """Object-space Mu clips on bindPose NLA (GrapplingArm OuterSleeve sleeves).
+
+    Control-armature bone clips may also sit on bindPose after import; skip those.
+    """
+    animations = {}
+    ad = getattr(obj, "animation_data", None)
+    if not ad:
+        return animations
+    for track in ad.nla_tracks:
+        if _is_fx_preview_anim(track):
+            continue
+        if not track.strips:
+            continue
+        strip_act = track.strips[0].action
+        if _is_fx_preview_anim(strip_act):
+            continue
+        try:
+            if not (strip_act.get("mu_clip_name") or strip_act.get("mu_anim_host")):
+                continue
+        except Exception:
+            continue
+        if not any(
+            not (fc.data_path or "").startswith("pose.bones")
+            for fc in iter_action_fcurves(strip_act)
+        ):
+            continue
+        try:
+            curve_path = strip_act.get("mu_unity_curve_path") or path
+            if curve_path is not None:
+                curve_path = str(curve_path)
+        except Exception:
+            curve_path = path
+        key = _clip_dict_key(track.name, curve_path, strip_act)
+        if key not in animations:
+            animations[key] = []
+        animations[key].append((track, curve_path, "obj"))
+    return animations
+
+
 def collect_animations(obj, path=""):
     from .armature import is_bindpose_armature
     animations = {}
     path = _mu_export_path(obj, path)
-    # Do not collect NLA on the bindPose armature itself (control armature holds bone anims)
-    if not (type(obj.data) == bpy.types.Armature and is_bindpose_armature(obj)):
+    if type(obj.data) == bpy.types.Armature and is_bindpose_armature(obj):
+        extend_animations(animations, bindpose_object_animations(obj, path))
+    else:
         extend_animations(animations, object_animations(obj, path))
     if type(obj.data) == bpy.types.Mesh:
         for mat in obj.data.materials:
@@ -641,11 +709,16 @@ def make_curve(mu, muobj, curve, path, typ, action=None, anim_root=None):
     if not mucurve.keys and curve.keyframe_points:
         for kp in curve.keyframe_points:
             mucurve.keys.append(make_key(kp, mult))
-    if action is not None and typ in {"obj", "lit"}:
+    # Transform/light curves: ``path`` (rel_path from export hierarchy) is
+    # authoritative. Overwriting with import-time mu_unity_curve_path broke
+    # round-trip when export strips .NNN from GO names but stored paths still
+    # had them (ht2 radiator 36→51 clips) or collapsed siblings (strut4 vs
+    # strut4.001). Material paths are set via curve_rel in make_animations.
+    if (action is not None and typ in {"obj", "lit"} and not path):
         try:
             stored = action.get("mu_unity_curve_path")
             if stored is not None and str(stored):
-                mucurve.path = str(stored)
+                mucurve.path = normalize_mu_curve_path(str(stored))
         except Exception:
             pass
     return mucurve

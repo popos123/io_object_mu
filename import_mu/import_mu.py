@@ -299,6 +299,10 @@ def create_object(mu, muobj, parent):
             # print(obj.rotation_quaternion)
 
     muobj.bobj = obj
+    try:
+        obj["mu_unity_transform_name"] = str(xform.name or "")
+    except Exception:
+        pass
     if getattr(muobj, "_light_enabled_default", None) is not None:
         obj["mu_light_enabled"] = float(muobj._light_enabled_default)
     # Attach MuParticles to this GO (Unity-style: same transform as mesh/empty)

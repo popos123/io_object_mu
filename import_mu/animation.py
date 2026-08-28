@@ -776,16 +776,10 @@ def create_action(mu, path, clip, host=None):
             objname = ".".join([host_name, "mat"])
         else:
             objname = ".".join([host_name, subpath])
-        rel = (curve.path or "").strip()
-        act_base = rel or path or ""
         if mu_path:
-            full = str(mu_path).strip()
-            if not rel:
-                act_base = full
-            elif full == rel or full.endswith("/" + rel):
-                # Prefer the resolved Mu hierarchy path so anim-only stubs
-                # (springTop1.001 etc.) stay separate after export/reimport.
-                act_base = full
+            act_base = str(mu_path).strip()
+        else:
+            act_base = (curve.path or "").strip() or path or ""
         actpath = "/".join([act_base, objname])
         if actpath not in actions:
             act = bpy.data.actions.new(objname)

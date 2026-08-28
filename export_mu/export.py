@@ -25,7 +25,7 @@ from mathutils import Vector, Quaternion
 from .. import properties
 from ..mu import Mu
 from ..mu import MuObject, MuTransform, MuTagLayer
-from ..utils import strip_nnn, collect_collections
+from ..utils import strip_nnn, collect_collections, unity_export_name
 
 from .animation import collect_animations, find_path_root, make_animations, group_animations_by_host
 from .collider import make_collider
@@ -35,7 +35,7 @@ from .volume import model_volume
 
 def make_transform(obj):
     transform = MuTransform()
-    transform.name = strip_nnn(obj.name)
+    transform.name = unity_export_name(obj)
     # Prefer Unity locals stored before bindPose SMR-space bake (colliders)
     try:
         if "mu_unity_rotation" in obj:

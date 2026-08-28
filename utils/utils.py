@@ -48,6 +48,30 @@ def strip_nnn(name):
     return name[:ind]
 
 
+def normalize_mu_curve_path(path):
+    """Strip Blender uniquifier segments (.001) from each Mu curve path part."""
+    path = str(path or "").strip()
+    if not path:
+        return path
+    return "/".join(strip_nnn(seg) for seg in path.split("/") if seg)
+
+
+def unity_export_name(obj):
+    """Unity ``transform.name`` for .mu export (exact stock name when stored)."""
+    if obj is None:
+        return ""
+    try:
+        stored = obj.get("mu_unity_transform_name")
+        if stored is not None and str(stored):
+            return str(stored)
+    except Exception:
+        pass
+    try:
+        return strip_nnn(obj.name)
+    except Exception:
+        return str(getattr(obj, "name", "") or "")
+
+
 def is_hideable_collider_name(name):
     """True for dedicated collider GOs; False for visuals named ``Collider``.
 
