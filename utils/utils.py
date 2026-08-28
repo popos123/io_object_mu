@@ -30,7 +30,12 @@ def strip_nnn(name):
     # ∧ separates the export name from the modeling name
     ind = name.rfind("∧")
     if ind >= 0:
-        return name[:ind]
+        base = name[:ind]
+        # iROSA_attach.001∧ → iROSA_attach (Blender uniquifier, not Unity name)
+        dot = base.rfind(".")
+        if dot >= 0 and len(base) - dot == 4 and base[dot + 1:].isdigit():
+            base = base[:dot]
+        return base
     # legacy check for blender's duplicate name separator
     # causes problems for naming schemes that includ the part size
     # but forcing people to add ∧ after all their objects isn't a

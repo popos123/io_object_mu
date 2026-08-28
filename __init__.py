@@ -145,9 +145,24 @@ def register():
         _mu_colorpalettes.register()
     except Exception:
         pass
+    try:
+        from .import_mu.name_protect import ensure_name_protect_handler
+        ensure_name_protect_handler()
+    except Exception:
+        pass
 
 
 def unregister():
+    try:
+        from .mu_browser.panels import remove_alc_redraw_handler
+        remove_alc_redraw_handler()
+    except Exception:
+        pass
+    try:
+        from .import_mu.name_protect import remove_name_protect_handler
+        remove_name_protect_handler()
+    except Exception:
+        pass
     try:
         from .import_ksp.mu_ops import (
             remove_selection_handler,

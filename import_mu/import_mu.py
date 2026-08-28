@@ -21,6 +21,7 @@
 
 from struct import unpack
 import os.path
+import uuid
 from math import pi, sqrt
 
 import bpy
@@ -30,6 +31,7 @@ from mathutils import Vector, Quaternion
 from ..mu import Mu, MuAnimation, MuRenderer, MuParticles
 from ..shader import make_shader
 from ..utils import set_transform, create_data_object
+from .name_protect import mark_protected_name
 
 from .exception import MuImportError
 from .animation import create_action, create_object_paths, finalize_animation_preview
@@ -77,7 +79,9 @@ type_handlers = {
 def create_protected_data_object(collection, name, data, xform):
     # protect the imported name from blender's duplicate name extension
     name += "∧"
-    return create_data_object(collection, name, data, xform)
+    obj = create_data_object(collection, name, data, xform)
+    mark_protected_name(obj)
+    return obj
 
 def _is_bindpose_object(obj):
     if not obj or type(getattr(obj, "data", None)) != bpy.types.Armature:
@@ -543,9 +547,100 @@ def process_mu(mu, mudir):
         print(f"WARNING: flare preview: {e}")
     return root
 
+def _tag_import_objects(mu):
+    """Tag every Blender object belonging to this .mu import.
+    Do not rely on Blender parenting here. A single .mu import can result
+    in multiple top-level Blender objects, armature helpers, generated
+    objects, animation stubs, etc.
+    The unique ID lets the MU browser treat all of them as one model.
+    """
+    import_id = str(getattr(mu, "import_id", "") or "")
+    if not import_id:
+        return
+    collections = []
+    for attr in ("main_collection", "vis_collection", "collider_collection", "collection"):
+        col = getattr(mu, attr, None)
+        if col is not None and col not in collections:
+            collections.append(col)
+    seen = set()
+
+    def tag_collection(col):
+        if col is None:
+            return
+        for obj in list(col.objects):
+            ptr = obj.as_pointer()
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            try:
+                obj["mu_import_id"] = import_id
+                obj["mu_import_source"] = str(getattr(mu, "filepath_stem", "")or getattr(mu, "name", "")or "")
+                obj["mu_import_path"] = str(getattr(mu, "filepath", "")or "")
+                mark_protected_name(obj)
+            except Exception:
+                pass
+            # Important: also follow Blender parenting.
+            for child in obj.children:
+                tag_object(child)
+        for child_col in col.children:
+            tag_collection(child_col)
+    def tag_object(obj):
+        if obj is None:
+            return
+        ptr = obj.as_pointer()
+        if ptr in seen:
+            return
+        seen.add(ptr)
+        try:
+            obj["mu_import_id"] = import_id
+            obj["mu_import_source"] = str(getattr(mu, "filepath_stem", "")or getattr(mu, "name", "")or "")
+            obj["mu_import_path"] = str(getattr(mu, "filepath", "")or "")
+            mark_protected_name(obj)
+        except Exception:
+            pass
+        for child in obj.children:
+            tag_object(child)
+    for col in collections:
+        tag_collection(col)
+    # Material clips are not Blender objects — tag materials used by this import.
+    mat_seen = set()
+    for obj in bpy.data.objects:
+        try:
+            if str(obj.get("mu_import_id", "")) != import_id:
+                continue
+        except Exception:
+            continue
+        try:
+            slots = getattr(obj, "material_slots", []) or []
+        except Exception:
+            slots = []
+        for slot in slots:
+            mat = getattr(slot, "material", None)
+            if mat is None:
+                continue
+            try:
+                ptr = mat.as_pointer()
+            except Exception:
+                ptr = id(mat)
+            if ptr in mat_seen:
+                continue
+            mat_seen.add(ptr)
+            try:
+                mat["mu_import_id"] = import_id
+                mat["mu_import_source"] = str(
+                    getattr(mu, "filepath_stem", "") or getattr(mu, "name", "") or "")
+                mat["mu_import_path"] = str(getattr(mu, "filepath", "") or "")
+            except Exception:
+                pass
+
 def import_mu(collection, filepath, create_colliders, force_armature, force_mesh=False):
     mu = Mu()
     mu.messages = []
+    # Unique ID for this particular .mu import session.
+    # Every Blender object created from this file receives the same ID.
+    # This is intentionally different from the filename/path so two
+    # simultaneously imported copies of the same .mu stay independent.
+    mu.import_id = uuid.uuid4().hex
     mu.create_colliders = create_colliders
     mu.force_armature = force_armature
     mu.force_mesh = force_mesh
@@ -565,12 +660,23 @@ def import_mu(collection, filepath, create_colliders, force_armature, force_mesh
 
     _mu_progress(6, text="Processing model…", force=True)
     root = process_mu(mu, os.path.dirname(filepath))
+    # Tag the COMPLETE Blender representation of this .mu.
+    # This must happen after process_mu(), because armatures, animation
+    # stubs and other generated objects may not exist before that point.
+    _tag_import_objects(mu)
     try:
         if root is not None:
             root["ksp_mu_path"] = os.path.abspath(filepath)
             root["ksp_mu_name"] = root_name
+            root["mu_import_id"] = str(mu.import_id)
     except Exception:
         pass
+    # Summary needs mu_import_id on objects — must run after _tag_import_objects.
+    try:
+        from .animation import print_mu_animation_summary
+        print_mu_animation_summary(force=True)
+    except Exception as e:
+        print("WARN: MU anim summary failed: %s" % (e,))
     _mu_progress(99, text="Import complete")
     return root, mu
 

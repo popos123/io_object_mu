@@ -24,8 +24,12 @@ import math
 from mathutils import Vector, Quaternion
 from math import pi
 from .light import light_power
+import importlib
+from ..utils import action_compat as _action_compat_mod
+importlib.reload(_action_compat_mod)
 from ..utils.action_compat import (
-    fcurve_new, push_action_to_nla, apply_mu_curve_wrap, apply_mu_clip_wrap_to_strip, mu_wrap_name,
+    fcurve_new, push_action_to_nla, apply_mu_curve_wrap, apply_mu_clip_wrap_to_strip,
+    mu_wrap_name, count_action_fcurves, actions_clip_length,
 )
 
 #mess with the heads of 6.28... fans :P
@@ -35,6 +39,7 @@ tau = pi / 180
 MU_IMPORT_CLIPS = []
 MU_IMPORT_GENERATION = 0
 _MU_SUMMARY_DONE_GEN = -1
+_MU_PLAY_TIMER_GEN = -1
 
 
 property_map = {
@@ -457,6 +462,80 @@ def _ensure_path_object(mu, mu_path):
         parent_path = p
     return mu.object_paths.get(mu_path)
 
+
+def _control_armature_obj(muobj):
+    arm = getattr(muobj, "armature", None)
+    arm_obj = getattr(arm, "armature_obj", None) if arm else None
+    if not isinstance(arm_obj, bpy.types.Object):
+        owner = getattr(muobj, "owner", None)
+        arm_obj = getattr(owner, "armature_obj", None) if owner else None
+    return arm_obj if isinstance(arm_obj, bpy.types.Object) else None
+
+
+def _bone_pose_anim_ok(arm_obj, bone_name):
+    if not arm_obj or not bone_name:
+        return False
+    try:
+        n = arm_obj.name or ""
+    except Exception:
+        n = ""
+    if n.endswith(".bindPose") or ".bindPose." in n:
+        return False
+    try:
+        return bone_name in arm_obj.data.bones
+    except Exception:
+        return False
+
+
+def _ensure_anim_object_host(mu, mu_path, muobj):
+    """Return a Blender object for object-space clip curves on ``mu_path``.
+
+    Clip paths that only exist for animation (spring bones referenced by
+    SkinnedMeshRenderer but absent from the transform tree) get hidden stub
+    empties on first import. After export/reimport the curve paths often match
+    bindPose bones instead — pose keys on bindPose are not collected on export,
+    so keep using a dedicated object-space host like the first import.
+    """
+    if getattr(muobj, "bobj", None):
+        return muobj.bobj
+    existing = mu.object_paths.get(mu_path)
+    if existing is not None and getattr(existing, "bobj", None):
+        return existing.bobj
+    stub = _ensure_path_object(mu, mu_path)
+    if stub is not None and getattr(stub, "bobj", None):
+        return stub.bobj
+    name = mu_path.rsplit("/", 1)[-1] if mu_path else "anim"
+    try:
+        tname = getattr(getattr(muobj, "transform", None), "name", None)
+        if tname:
+            name = str(tname)
+    except Exception:
+        pass
+    col = getattr(mu, "collection", None) or bpy.context.scene.collection
+    bobj = bpy.data.objects.new(name, None)
+    bobj.empty_display_type = 'PLAIN_AXES'
+    col.objects.link(bobj)
+    try:
+        bobj["mu_anim_stub"] = 1
+        bobj.hide_render = True
+        bobj.hide_viewport = True
+    except Exception:
+        pass
+    parent_bobj = None
+    parts = (mu_path or "").split("/")
+    for i in range(len(parts) - 1, 0, -1):
+        anc = mu.object_paths.get("/".join(parts[:i]))
+        if anc is not None and getattr(anc, "bobj", None):
+            parent_bobj = anc.bobj
+            break
+    if parent_bobj is not None:
+        bobj.parent = parent_bobj
+    try:
+        muobj.bobj = bobj
+    except Exception:
+        pass
+    return bobj
+
 def create_action(mu, path, clip, host=None):
     #print(clip.name)
     actions = {}
@@ -578,6 +657,18 @@ def create_action(mu, path, clip, host=None):
                     continue
             else:
                 muobj = mu.object_paths[mu_path]
+            if curve.path:
+                leaf = curve.path.rstrip("/").split("/")[-1]
+                try:
+                    mname = str(getattr(getattr(muobj, "transform", None), "name", "") or "")
+                except Exception:
+                    mname = ""
+                if leaf and mname and mname != leaf:
+                    alt_path = "/".join([p for p in (path, curve.path) if p])
+                    alt = _ensure_path_object(mu, alt_path)
+                    if alt is not None:
+                        muobj = alt
+                        mu_path = alt_path
             # Multi-segment clip path bound to a GO whose hierarchy path does
             # not end with that clip path (capsule/hatch → …/hatch): retarget.
             cpath = (curve.path or "").rstrip("/")
@@ -600,28 +691,14 @@ def create_action(mu, path, clip, host=None):
         dppref = ""
         use_pose_bone = False
         if hasattr(muobj, "bone"):
-            arm = getattr(muobj, "armature", None)
-            arm_obj = getattr(arm, "armature_obj", None) if arm else None
-            if not isinstance(arm_obj, bpy.types.Object):
-                # owner.armature_obj path (set after create_armature)
-                owner = getattr(muobj, "owner", None)
-                arm_obj = getattr(owner, "armature_obj", None) if owner else None
-            if isinstance(arm_obj, bpy.types.Object):
+            bname = str(getattr(muobj, "bone", "") or "")
+            arm_obj = _control_armature_obj(muobj)
+            if _bone_pose_anim_ok(arm_obj, bname):
                 obj = arm_obj
-                dppref = f'pose.bones["{muobj.bone}"].'
+                dppref = f'pose.bones["{bname}"].'
                 use_pose_bone = True
-            elif hasattr(muobj, "bobj") and muobj.bobj:
-                # Fallback: animate the hierarchy object when no armature exists
-                obj = muobj.bobj
             else:
-                # Last resort: create a temporary empty so curves are not dropped
-                print("Warning: No armature_obj for bone at path: %s "
-                      "(creating hierarchy empty)" % (mu_path))
-                col = getattr(mu, "collection", None) or bpy.context.scene.collection
-                obj = bpy.data.objects.new(muobj.transform.name, None)
-                col.objects.link(obj)
-                muobj.bobj = obj
-                muobj.force_import = True
+                obj = _ensure_anim_object_host(mu, mu_path, muobj)
         elif hasattr(muobj, "bobj") and muobj.bobj:
             obj = muobj.bobj
         else:
@@ -686,13 +763,37 @@ def create_action(mu, path, clip, host=None):
                     light_obj["mu_light_enabled"] = 1.0
             except Exception:
                 pass
-        host_name = (muobj.bobj.name if getattr(muobj, "bobj", None)
-                     else getattr(obj, "name", "obj"))
-        objname = ".".join([host_name, subpath])
-        name = objname
-        actpath = "/".join([curve.path, name])
+        try:
+            host_name = str(getattr(getattr(muobj, "transform", None), "name", "") or "")
+        except Exception:
+            host_name = ""
+        if not host_name:
+            host_name = (muobj.bobj.name if getattr(muobj, "bobj", None)
+                         else getattr(obj, "name", "obj"))
+        if is_shader_curve or is_audio_curve:
+            # Keep material/audio curves off transform actpaths — mixed Actions
+            # only NLA-push to the last curve's owner and shader export skips them.
+            objname = ".".join([host_name, "mat"])
+        else:
+            objname = ".".join([host_name, subpath])
+        rel = (curve.path or "").strip()
+        act_base = rel or path or ""
+        if mu_path:
+            full = str(mu_path).strip()
+            if not rel:
+                act_base = full
+            elif full == rel or full.endswith("/" + rel):
+                # Prefer the resolved Mu hierarchy path so anim-only stubs
+                # (springTop1.001 etc.) stay separate after export/reimport.
+                act_base = full
+        actpath = "/".join([act_base, objname])
         if actpath not in actions:
-            actions[actpath] = bpy.data.actions.new(name), obj
+            act = bpy.data.actions.new(objname)
+            actions[actpath] = act, obj
+            try:
+                act["mu_unity_curve_path"] = curve.path or ""
+            except Exception:
+                pass
         act, obj = actions[actpath]
         if is_shader_curve or is_audio_curve:
             # Preserve Unity renderer-relative path (shared materials may be
@@ -906,6 +1007,12 @@ def create_action(mu, path, clip, host=None):
     except Exception:
         pass
 
+    clip_len = 0.0
+    try:
+        clip_len = float(actions_clip_length([a for a, _o in actions.values()]) or 0)
+    except Exception:
+        clip_len = 0.0
+
     for name in actions:
         act, obj = actions[name]
         # Remember which Mu hierarchy node owned this Animation component so
@@ -913,6 +1020,12 @@ def create_action(mu, path, clip, host=None):
         try:
             act["mu_anim_host"] = path
             act["mu_clip_name"] = clip.name
+            try:
+                import_id = str(getattr(mu, "import_id", "") or "")
+                if import_id:
+                    act["mu_import_id"] = import_id
+            except Exception:
+                pass
             # Isolated per Action — never shared across clips/hosts
             wm = int(wrap_mode)
             if wm == 0:
@@ -922,6 +1035,8 @@ def create_action(mu, path, clip, host=None):
             act["mu_clip_wrap_mode"] = wm
             act["mu_auto_play"] = int(auto_play)
             act["mu_import_gen"] = int(MU_IMPORT_GENERATION)
+            if clip_len > 0:
+                act["mu_clip_length"] = clip_len
             if selected_clip:
                 act["mu_animation_clip"] = selected_clip
         except Exception:
@@ -1016,14 +1131,254 @@ def _mu_int(val, default=0):
         return default
 
 
-def print_mu_animation_summary(force=False):
-    """Compact one-liner of every Action created in this import generation.
+def _import_id_for_generation(gen):
+    for act in bpy.data.actions:
+        try:
+            if int(act.get("mu_import_gen", -1)) != int(gen):
+                continue
+        except Exception:
+            continue
+        try:
+            iid = str(act.get("mu_import_id") or "")
+            if iid:
+                return iid
+        except Exception:
+            pass
+    return ""
 
-    Counts distinct Actions tagged with mu_import_gen (matches NLA tracks),
-    not just create_action host calls. Only force=True prints (no timer spam).
 
-    Identical (name, AP, WM) groups are collapsed: ``antenna=2 AP=yes WM=Once``.
+def _collect_entries_for_generation(gen, import_id=""):
+    """Build panel-style entry rows from Actions tagged with mu_import_gen."""
+    try:
+        from ..mu_browser.panels import _is_preview_action
+    except Exception:
+        _is_preview_action = None
+    entries = []
+    seen = set()
+    for act in bpy.data.actions:
+        try:
+            if int(act.get("mu_import_gen", -1)) != int(gen):
+                continue
+        except Exception:
+            continue
+        if _is_preview_action is not None:
+            try:
+                if _is_preview_action(act):
+                    continue
+            except Exception:
+                pass
+        if import_id:
+            try:
+                aid = str(act.get("mu_import_id") or "")
+            except Exception:
+                aid = ""
+            if aid and aid != str(import_id):
+                continue
+        try:
+            ptr = act.as_pointer()
+        except Exception:
+            ptr = id(act)
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        owner = ""
+        try:
+            owner = str(act.get("mu_nla_owner") or act.get("mu_anim_bobj") or "")
+        except Exception:
+            owner = ""
+        try:
+            clip_name = str(act.get("mu_clip_name") or act.name or "?")
+        except Exception:
+            clip_name = act.name or "?"
+        try:
+            wrap = int(act.get("mu_clip_wrap_mode", 1) or 1)
+        except Exception:
+            wrap = 1
+        try:
+            autoplay = bool(int(act.get("mu_auto_play", 0) or 0))
+        except Exception:
+            autoplay = False
+        try:
+            anim_host = str(act.get("mu_anim_host") or "")
+        except Exception:
+            anim_host = ""
+        try:
+            anim_bobj = str(act.get("mu_anim_bobj") or "")
+        except Exception:
+            anim_bobj = ""
+        entries.append({
+            "action": act,
+            "clip_name": clip_name,
+            "owner": owner,
+            "wrap": wrap,
+            "autoplay": autoplay,
+            "anim_host": anim_host,
+            "anim_bobj": anim_bobj,
+        })
+    return entries
+
+
+def _summary_entries_for_generation(gen):
+    """Same Action rows as the MU Animation panel (preview / FX filtered)."""
+    try:
+        from ..mu_browser.panels import collect_mu_animation_entries_by_import_id
+    except Exception:
+        collect_mu_animation_entries_by_import_id = None
+
+    import_id = _import_id_for_generation(gen)
+    entries = []
+    if collect_mu_animation_entries_by_import_id is not None and import_id:
+        entries = collect_mu_animation_entries_by_import_id(import_id)
+    if not entries:
+        entries = _collect_entries_for_generation(gen, import_id)
+    return entries, import_id
+
+
+def _entry_curve_wrap_name(act):
+    """Dominant MuCurve wrap for one Action (``Mixed`` if curves disagree)."""
+    try:
+        from ..mu_browser.panels import _curve_wrap_of_action
+        cw = int(_curve_wrap_of_action(act))
+    except Exception:
+        cw = 8
+    if cw == 0:
+        return "Mixed"
+    return mu_wrap_name(cw)
+
+
+def _stats_from_entries(entries, import_id=""):
+    """Panel header counts from the same entry list the INFO tail uses."""
+    try:
+        from ..mu_browser.panels import mu_animation_entry_stats
+    except Exception:
+        mu_animation_entry_stats = None
+    if mu_animation_entry_stats is not None and entries:
+        return mu_animation_entry_stats(entries, import_id)
+
+    host_keys = set()
+    clip_rows = len(entries)
+    curve_count = 0
+    for ent in entries:
+        act = ent.get("action")
+        owner = ent.get("owner") or ""
+        try:
+            from ..mu_browser.panels import _host_key_of_action
+            host_keys.add(_host_key_of_action(act, owner))
+        except Exception:
+            pass
+        if act is not None:
+            try:
+                curve_count += int(count_action_fcurves(act))
+            except Exception:
+                pass
+    roots = 0
+    if import_id:
+        try:
+            from ..mu_browser.panels import _count_import_roots
+            roots = _count_import_roots(import_id)
+        except Exception:
+            roots = 0
+    if roots == 0 and host_keys:
+        roots = 1
+    return roots, len(host_keys), clip_rows, curve_count
+
+
+def _summary_stats_for_generation(gen):
+    """Same rules as MU Animation panel (mu_animation_entry_stats)."""
+    entries, import_id = _summary_entries_for_generation(gen)
+    return _stats_from_entries(entries, import_id)
+
+
+def _summary_host_label(ent):
+    """Unity host name for INFO (strip Blender ``∧`` / ``.NNN``)."""
+    from ..utils import strip_nnn
+
+    def _clean(name):
+        name = str(name or "")
+        if not name:
+            return ""
+        try:
+            return strip_nnn(name) or name
+        except Exception:
+            return name
+
+    bobj = _clean(ent.get("anim_bobj") or "")
+    if bobj:
+        return bobj
+    path = str(ent.get("anim_host") or "")
+    if path:
+        leaf = path.rstrip("/").split("/")[-1]
+        leaf = _clean(leaf)
+        if leaf:
+            return leaf
+    owner = _clean(ent.get("owner") or "")
+    return owner or "host"
+
+
+def format_mu_animation_summary(gen=None):
+    """Return the compact INFO one-liner (panel rows + AP / clip wrap / curve wrap).
+
+    Roots/Hosts/Clips/Curves follow the MU Animation panel header.
+    Clips = one NLA Action row (not unique Unity MuClip names).
+
+    The tail stacks identical panel rows like the Animation list:
+    ``host.clip AP=…`` or ``host.clip=N AP=…`` when N>1.
+    Host is in the label because two Animation GOs may share a clip name.
+    Auto Play is per host. WM is per (host, MuClip). CW is per Action;
+    rows with different CW do not stack.
     """
+    from collections import OrderedDict
+
+    if gen is None:
+        gen = int(MU_IMPORT_GENERATION)
+    entries, import_id = _summary_entries_for_generation(gen)
+    n_roots, n_hosts, n_clips, n_curves = _stats_from_entries(entries, import_id)
+
+    stacked = OrderedDict()
+
+    def _stack(host, clip, ap, wm, cw):
+        key = (host, clip, ap, wm, cw)
+        stacked[key] = stacked.get(key, 0) + 1
+
+    for ent in entries:
+        act = ent.get("action")
+        host = _summary_host_label(ent)
+        clip = str(ent.get("clip_name") or "?")
+        ap = "yes" if ent.get("autoplay") else "no"
+        try:
+            wm = mu_wrap_name(int(ent.get("wrap") or 1))
+        except Exception:
+            wm = "?"
+        _stack(host, clip, ap, wm, _entry_curve_wrap_name(act))
+
+    if not stacked:
+        for c in list(MU_IMPORT_CLIPS):
+            host = _summary_host_label({
+                "anim_host": c.get("host") or "",
+                "anim_bobj": "",
+                "owner": "",
+            })
+            clip = str(c.get("name") or "?")
+            ap = "yes" if c.get("auto_play") else "no"
+            wm = mu_wrap_name(int(c.get("wrap") or 1))
+            _stack(host, clip, ap, wm, "Clamp")
+
+    parts = []
+    for (host, clip, ap, wm, cw), n in stacked.items():
+        label = "%s.%s" % (host, clip)
+        if n > 1:
+            label = "%s=%d" % (label, n)
+        parts.append("%s AP=%s WM=%s CW=%s" % (label, ap, wm, cw))
+
+    prefix = "INFO: Roots=%d Hosts=%d Clips=%d Curves=%d" % (
+        n_roots, n_hosts, n_clips, n_curves)
+    if not parts:
+        return prefix
+    return "%s | %s" % (prefix, " | ".join(parts))
+
+
+def print_mu_animation_summary(force=False):
+    """Print ``format_mu_animation_summary`` once per import generation."""
     global _MU_SUMMARY_DONE_GEN
     if not force:
         return
@@ -1031,66 +1386,62 @@ def print_mu_animation_summary(force=False):
         gen = int(MU_IMPORT_GENERATION)
         if gen == int(_MU_SUMMARY_DONE_GEN):
             return
-        # Ordered groups: (short_name, ap, wm) → count
-        from collections import OrderedDict
-        groups = OrderedDict()
-        seen = set()
-        total = 0
-
-        def _add(name, ap, wm):
-            nonlocal total
-            short = name if len(name) <= 12 else name[:12]
-            key = (short, ap, wm)
-            groups[key] = groups.get(key, 0) + 1
-            total += 1
-
-        for act in bpy.data.actions:
-            try:
-                if int(act.get("mu_import_gen", -1)) != gen:
-                    continue
-            except Exception:
-                continue
-            ptr = act.as_pointer()
-            if ptr in seen:
-                continue
-            seen.add(ptr)
-            try:
-                name = str(act.get("mu_clip_name") or act.name or "?")
-            except Exception:
-                name = act.name or "?"
-            try:
-                ap = "yes" if int(act.get("mu_auto_play", 0) or 0) else "no"
-            except Exception:
-                ap = "no"
-            try:
-                wm = mu_wrap_name(int(act.get("mu_clip_wrap_mode", 1) or 1))
-            except Exception:
-                wm = "?"
-            _add(name, ap, wm)
-
-        if not groups:
-            reg_seen = set()
-            for c in list(MU_IMPORT_CLIPS):
-                key = (c.get("host") or "", c.get("name") or "")
-                if key in reg_seen:
-                    continue
-                reg_seen.add(key)
-                name = str(c.get("name") or "?")
-                ap = "yes" if c.get("auto_play") else "no"
-                wm = mu_wrap_name(int(c.get("wrap") or 1))
-                _add(name, ap, wm)
-
-        if groups:
-            parts = []
-            for (short, ap, wm), cnt in groups.items():
-                if cnt > 1:
-                    parts.append("%s=%d AP=%s WM=%s" % (short, cnt, ap, wm))
-                else:
-                    parts.append("%s AP=%s WM=%s" % (short, ap, wm))
-            print("INFO: Anim=%d | %s" % (total, " | ".join(parts)))
+        print(format_mu_animation_summary(gen))
         _MU_SUMMARY_DONE_GEN = gen
     except Exception as e:
         print("WARN: MU anim summary failed: %s" % (e,))
+
+
+def _nla_belongs_to_gen(id_data, gen):
+    """True if this object/material has an NLA Action from this import batch."""
+    ad = getattr(id_data, "animation_data", None)
+    if not ad:
+        return False
+    try:
+        tracks = list(ad.nla_tracks)
+    except Exception:
+        tracks = []
+    for track in tracks:
+        try:
+            strips = list(track.strips)
+        except Exception:
+            strips = []
+        for strip in strips:
+            act = getattr(strip, "action", None)
+            if act is None:
+                continue
+            try:
+                if int(act.get("mu_import_gen", -1)) == int(gen):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _import_has_autoplay(gen):
+    """Auto Play only for the .mu just imported — not leftovers in the scene."""
+    gen = int(gen)
+    for act in bpy.data.actions:
+        try:
+            if int(act.get("mu_import_gen", -1)) != gen:
+                continue
+        except Exception:
+            continue
+        if _mu_int(act.get("mu_auto_play", 0), 0):
+            return True
+        try:
+            bname = act.get("mu_anim_bobj")
+            if bname:
+                bobj = bpy.data.objects.get(str(bname))
+                if bobj is not None and _mu_int(
+                        bobj.get("mu_animation_autoplay", 0), 0):
+                    return True
+        except Exception:
+            pass
+    for rec in list(MU_IMPORT_CLIPS):
+        if _mu_int(rec.get("auto_play", 0), 0):
+            return True
+    return False
 
 
 def finalize_animation_preview():
@@ -1100,14 +1451,25 @@ def finalize_animation_preview():
     MuAnimation selected clip when autoPlay is set, otherwise Deploy/stowed
     heuristic. Mute the rest (e.g. Drill_Running).
 
-    Animation console summary prints once at the end of finalize.
+    Playback starts only when THIS import has Auto Play. A later import
+    without Auto Play must not unpause the timeline (or re-mute older NLA).
     """
+    global _MU_PLAY_TIMER_GEN
     try:
-        bpy.context.scene.frame_set(int(bpy.context.scene.frame_start))
+        gen = int(MU_IMPORT_GENERATION)
     except Exception:
-        pass
+        gen = 0
+    has_autoplay = _import_has_autoplay(gen)
+
+    if has_autoplay:
+        try:
+            bpy.context.scene.frame_set(int(bpy.context.scene.frame_start))
+        except Exception:
+            pass
 
     def _finalize(id_data):
+        if not _nla_belongs_to_gen(id_data, gen):
+            return
         ad = getattr(id_data, "animation_data", None)
         if not ad or not ad.nla_tracks:
             return
@@ -1126,7 +1488,17 @@ def finalize_animation_preview():
                 cname = act.get("mu_clip_name", track.name)
                 if act.get("mu_animation_clip"):
                     component_clip = str(act["mu_animation_clip"])
-                if int(act.get("mu_auto_play", 0) or 0):
+                ap = int(act.get("mu_auto_play", 0) or 0)
+                if not ap:
+                    try:
+                        bname = act.get("mu_anim_bobj")
+                        if bname:
+                            bobj = bpy.data.objects.get(str(bname))
+                            if bobj is not None:
+                                ap = int(bobj.get("mu_animation_autoplay", 0) or 0)
+                    except Exception:
+                        ap = 0
+                if ap:
                     autoplay_clip = cname
         if autoplay_clip and autoplay_clip in names:
             keep = autoplay_clip
@@ -1146,14 +1518,13 @@ def finalize_animation_preview():
     for mat in bpy.data.materials:
         _finalize(mat)
 
-    # Optional: start playback when any clip has autoPlay
-    has_autoplay = False
-    for act in bpy.data.actions:
-        if _mu_int(act.get("mu_auto_play", 0), 0):
-            has_autoplay = True
-            break
     if has_autoplay:
+        _MU_PLAY_TIMER_GEN = gen
+
         def _start_animation():
+            # A newer import (or one without Auto Play) cancels this start.
+            if int(_MU_PLAY_TIMER_GEN) != gen:
+                return None
             try:
                 for window in bpy.context.window_manager.windows:
                     screen = window.screen
@@ -1170,6 +1541,9 @@ def finalize_animation_preview():
             bpy.app.timers.register(_start_animation, first_interval=0.25)
         except Exception:
             pass
+    else:
+        # Do not let a pending Auto Play timer from the previous .mu unpause.
+        _MU_PLAY_TIMER_GEN = -1
     # Engine / heat: restore EmissionMap (undo white-bypass) + soft blackbody
     try:
         from ..shader.shader import (
@@ -1202,8 +1576,4 @@ def finalize_animation_preview():
                 except Exception:
                     pass
 
-    # Console summary once per import generation (idempotent)
-    try:
-        print_mu_animation_summary(force=True)
-    except Exception as e:
-        print("WARN: MU anim summary failed: %s" % (e,))
+    # Console summary runs from import_mu after _tag_import_objects (needs mu_import_id).

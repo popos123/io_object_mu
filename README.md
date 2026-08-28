@@ -76,7 +76,6 @@ TODO
 * Add support for loading original thumbnails if they exist in GameData; the Thumbs → Regenerate button should regenerate them (e.g. for modded ReStock).
 * Add a loading progress bar when generating thumbnails (similar to .mu file import/export).
 * Refresh variants (the list of all active variants) after selecting an object imported via the MU panel.
-* Ensure that - Assumes INTERNAL is a direct child of the part root and correctly oriented (export_mu/cfgfile.py).
 * Add a debug button that prints all textures, sounds, and files used by a .mu file to the console, both before and after import.
 * Update the .ksp examples.
 * Use numpy → pixels.foreach_set instead of list comprehensions.

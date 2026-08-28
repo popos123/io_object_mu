@@ -172,6 +172,83 @@ def _clip_name_from_key(key):
     return key
 
 
+def _host_autoplay_from_animations(animations, anim_root=""):
+    """Read MuAnimation.autoPlay from the Animation GO (per-host, not per-clip).
+
+    Sibling hosts may share an identical clip name but differ in autoPlay.
+    The host empty's ``mu_animation_autoplay`` is authoritative after UI edits.
+    Prefer the object whose ``mu_animation_host`` matches this anim_root so a
+    leftover flag on an animated child cannot flip the host.
+    """
+    root_leaf = ""
+    if anim_root:
+        root_leaf = strip_nnn(str(anim_root).rstrip("/").split("/")[-1])
+    best = None  # (score, autoplay)
+    seen_bobjs = set()
+    for entries in animations.values():
+        for data in entries:
+            track, _path, _typ = data
+            action = track if isinstance(track, bpy.types.Action) else None
+            if action is None and not isinstance(track, bpy.types.Action):
+                try:
+                    strips = getattr(track, "strips", None)
+                    action = strips[0].action if strips else None
+                except Exception:
+                    action = None
+            if action is None:
+                continue
+            bname = None
+            try:
+                bname = action.get("mu_anim_bobj") or action.get("mu_nla_owner")
+            except Exception:
+                bname = None
+            if not bname:
+                continue
+            bname = str(bname)
+            if bname in seen_bobjs:
+                continue
+            seen_bobjs.add(bname)
+            try:
+                bobj = bpy.data.objects.get(bname)
+                if bobj is None or "mu_animation_autoplay" not in bobj:
+                    continue
+                ap = bool(int(bobj.get("mu_animation_autoplay", 0) or 0))
+                tagged = ""
+                try:
+                    tagged = str(bobj.get("mu_animation_host") or "")
+                except Exception:
+                    tagged = ""
+                score = 1
+                if anim_root and tagged == anim_root:
+                    score = 3
+                elif tagged:
+                    score = 2
+                elif root_leaf and strip_nnn(bobj.name) == root_leaf:
+                    score = 2
+                if best is None or score > best[0]:
+                    best = (score, ap)
+            except Exception:
+                pass
+    if best is None:
+        return None
+    return best[1]
+
+
+def _merge_entries_by_clip_name(animations):
+    """One MuClip per Unity clip name (host groups are already split).
+
+    Import creates one Blender Action per animated target; those must round-trip
+    as a single MuClip or KSP ``animationName = airlock`` sees duplicates.
+    """
+    merged = {}
+    for dict_key, entries in animations.items():
+        clip_name = _clip_name_from_key(dict_key)
+        if clip_name not in merged:
+            merged[clip_name] = []
+        merged[clip_name].extend(entries)
+    return merged
+
+
 def object_animations(obj, path):
     animations = {}
     typ = "obj"
@@ -382,6 +459,12 @@ def _anim_host_of(track_or_action, fallback_path):
     return ("path", fallback_path if fallback_path else "")
 
 
+def _norm_mu_path(path):
+    """Compare Unity paths ignoring Blender .NNN uniquifiers on segments."""
+    parts = [strip_nnn(s) for s in str(path or "").split("/") if s]
+    return "/".join(parts)
+
+
 def group_animations_by_host(animations, default_root):
     """Split collected animations into per-host groups for nested MuAnimation.
 
@@ -555,6 +638,16 @@ def make_curve(mu, muobj, curve, path, typ, action=None, anim_root=None):
     mucurve.keys = []
     for key in iter_export_keyframes(action, curve):
         mucurve.keys.append(make_key(key, mult))
+    if not mucurve.keys and curve.keyframe_points:
+        for kp in curve.keyframe_points:
+            mucurve.keys.append(make_key(kp, mult))
+    if action is not None and typ in {"obj", "lit"}:
+        try:
+            stored = action.get("mu_unity_curve_path")
+            if stored is not None and str(stored):
+                mucurve.path = str(stored)
+        except Exception:
+            pass
     return mucurve
 
 def transform_curves(muarm):
@@ -676,6 +769,21 @@ def make_animations_per_host(mu, animations, default_root=""):
     return out
 
 
+def _material_for_shader_export(muobj):
+    """Best-effort material for mumatprop fcurves on a mesh MuObject."""
+    bobj = getattr(muobj, "bobj", None)
+    if bobj is None:
+        return None
+    data = getattr(bobj, "data", None)
+    slots = getattr(data, "materials", None) if data else None
+    if not slots:
+        return None
+    for mat in slots:
+        if mat is not None:
+            return mat
+    return None
+
+
 def make_animations(mu, animations, anim_root):
     # Never write Ping-Pong viewport bake into .mu keys
     restore_all_pingpong_for_export()
@@ -684,14 +792,10 @@ def make_animations(mu, animations, anim_root):
     anim.autoPlay = False
     default_clip_name = None
     selected_clip_name = None
-    clip_names = set()
 
-    for dict_key in animations:
-        # dict_key may be composite "clip\\x00host\\x00ptr" — MuClip.name is plain
-        clip_name = _clip_name_from_key(dict_key)
-        if dict_key in clip_names:
-            continue
-        clip_names.add(dict_key)
+    by_clip = _merge_entries_by_clip_name(animations)
+
+    for clip_name, clip_entries in by_clip.items():
         clip = MuClip()
         if default_clip_name is None:
             default_clip_name = clip_name
@@ -706,7 +810,7 @@ def make_animations(mu, animations, anim_root):
         seen_actions = set()
         contributed = False
 
-        for data in animations[dict_key]:
+        for data in clip_entries:
             track, path, typ = data
             # Normalize Blender-only segments (.skin / .bindPose / ∧nnn)
             norm = "/".join(
@@ -755,9 +859,17 @@ def make_animations(mu, animations, anim_root):
             host_key = _anim_host_of(track, path)
             if anim_root:
                 belongs = False
+                root_norm = _norm_mu_path(anim_root)
+                path_norm = _norm_mu_path(path)
                 if host_key[0] == "path" and host_key[1]:
                     # Exact host path, or this entry IS the host object
-                    belongs = (host_key[1] == anim_root or path == anim_root)
+                    host_norm = _norm_mu_path(host_key[1])
+                    belongs = (
+                        host_norm == root_norm
+                        or path_norm == root_norm
+                        or host_key[1] == anim_root
+                        or path == anim_root
+                    )
                 elif host_key[0] == "bobj" and host_key[1]:
                     try:
                         action_tmp = track if isinstance(track, bpy.types.Action) else (
@@ -767,7 +879,9 @@ def make_animations(mu, animations, anim_root):
                             tagged = action_tmp.get("mu_anim_host") if hasattr(action_tmp, "get") else None
                             if not tagged and "mu_anim_host" in action_tmp:
                                 tagged = action_tmp["mu_anim_host"]
-                        if tagged and str(tagged) == anim_root:
+                        if tagged and (
+                                str(tagged) == anim_root
+                                or _norm_mu_path(tagged) == root_norm):
                             belongs = True
                         # Also accept when anim_root path ends with this bobj name
                         if not belongs and anim_root.rstrip("/").endswith("/" + str(host_key[1])):
@@ -776,7 +890,8 @@ def make_animations(mu, animations, anim_root):
                             belongs = True
                     except Exception:
                         pass
-                if not belongs and path == anim_root:
+                if not belongs and (
+                        path == anim_root or path_norm == root_norm):
                     belongs = True
                 if not belongs:
                     continue
@@ -808,8 +923,14 @@ def make_animations(mu, animations, anim_root):
                         pass
                 n_before = len(clip.curves)
                 for curve in iter_action_fcurves(action):
+                    export_typ = typ
+                    if export_typ in ("obj", "lit") and (
+                            (curve.data_path or "").startswith("mumatprop.")):
+                        mat = _material_for_shader_export(muobj)
+                        if mat is not None:
+                            export_typ = mat
                     curve_data = make_curve(
-                        mu, muobj, curve, curve_rel, typ, action=action,
+                        mu, muobj, curve, curve_rel, export_typ, action=action,
                         anim_root=anim_root)
                     if curve_data:
                         clip.curves.append(curve_data)
@@ -825,14 +946,11 @@ def make_animations(mu, animations, anim_root):
         if wrap_votes:
             from collections import Counter
             clip.wrapMode = int(Counter(wrap_votes).most_common(1)[0][0])
-        if clip_action is not None:
+        if clip_action is not None and selected_clip_name is None:
             try:
-                if int(clip_action.get("mu_auto_play", 0) or 0):
-                    anim.autoPlay = True
-                if selected_clip_name is None:
-                    value = clip_action.get("mu_animation_clip", "")
-                    if value:
-                        selected_clip_name = str(value)
+                value = clip_action.get("mu_animation_clip", "")
+                if value:
+                    selected_clip_name = str(value)
             except Exception:
                 pass
         # Skip empty clips (all entries filtered out as other hosts)
@@ -844,5 +962,8 @@ def make_animations(mu, animations, anim_root):
         anim.clip = selected_clip_name
     elif default_clip_name:
         anim.clip = default_clip_name
+    host_ap = _host_autoplay_from_animations(animations, anim_root)
+    if host_ap is not None:
+        anim.autoPlay = bool(host_ap)
     #print(f"Created animation: {anim}") # Debug animations
     return anim

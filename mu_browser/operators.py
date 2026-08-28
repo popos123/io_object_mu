@@ -60,7 +60,12 @@ def refresh_part_list(context):
 class KSPMU_OT_MuBrowserRefresh(bpy.types.Operator):
     bl_idname = "object.ksp_mu_browser_refresh"
     bl_label = "Refresh Parts"
+    bl_description = "Rescan GameData and rebuild the current category list"
     bl_options = {"REGISTER"}
+
+    @classmethod
+    def description(cls, context, properties):
+        return cls.bl_description
 
     force: BoolProperty(default=True)
 
@@ -291,6 +296,11 @@ class KSPMU_OT_MuBrowserGenThumbs(_ThumbBatchBase):
     """Generate only missing thumbnails for the current category."""
     bl_idname = "object.ksp_mu_browser_gen_thumbs"
     bl_label = "Generate Thumbnails"
+    bl_description = "Generate missing part thumbnails for the current category"
+
+    @classmethod
+    def description(cls, context, properties):
+        return cls.bl_description
 
     force: BoolProperty(default=False)
 
@@ -299,6 +309,11 @@ class KSPMU_OT_MuBrowserRegenThumbs(_ThumbBatchBase):
     """Force-regenerate thumbnails for the current category."""
     bl_idname = "object.ksp_mu_browser_regen_thumbs"
     bl_label = "Regenerate Thumbnails"
+    bl_description = "Force-regenerate part thumbnails for the current category"
+
+    @classmethod
+    def description(cls, context, properties):
+        return cls.bl_description
 
     force: BoolProperty(default=True)
 
@@ -308,6 +323,10 @@ class KSPMU_OT_MuBrowserSelect(bpy.types.Operator):
     bl_label = "Select Part"
     bl_description = "Select this part in the browser"
     bl_options = {"INTERNAL"}
+
+    @classmethod
+    def description(cls, context, properties):
+        return cls.bl_description
 
     index: IntProperty(default=0)
 
@@ -332,7 +351,12 @@ class KSPMU_OT_MuBrowserSelect(bpy.types.Operator):
 class KSPMU_OT_MuBrowserImportPart(bpy.types.Operator):
     bl_idname = "object.ksp_mu_browser_import_part"
     bl_label = "Import Part"
+    bl_description = "Import the selected part .mu into the scene"
     bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def description(cls, context, properties):
+        return cls.bl_description
 
     part_name: StringProperty(default="")
 

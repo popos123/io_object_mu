@@ -117,6 +117,21 @@ def flags_manifest_path():
     return os.path.join(flags_dir(), "manifest.json")
 
 
+def _gamedata_relative_source(src):
+    """Return ``Squad/Flags/foo.png`` — never an absolute machine path."""
+    if not src:
+        return ""
+    norm = str(src).replace("\\", "/")
+    low = norm.lower()
+    marker = "/gamedata/"
+    idx = low.rfind(marker)
+    if idx >= 0:
+        return norm[idx + len(marker):]
+    if ":" not in norm and not norm.startswith("/"):
+        return norm.lstrip("./")
+    return os.path.basename(norm)
+
+
 def _walk_gamedata_roots(mudir=None):
     roots = []
     try:
@@ -219,7 +234,7 @@ def sync_flags_from_gamedata(mudir=None, force=False):
             manifest["flags"].append({
                 "name": stem,
                 "file": dst_name,
-                "source": src.replace("\\", "/"),
+                "source": _gamedata_relative_source(src),
             })
     manifest["flags"].sort(key=lambda e: e["name"].lower())
     try:

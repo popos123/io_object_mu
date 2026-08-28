@@ -271,6 +271,55 @@ special_modelTypes = {
     'VOLUME': {},
 }
 
+def _mu_target_for_blender_name(mu, val):
+    """Map a Blender object name to its exported MuObject (no prefix collisions)."""
+    mapping = getattr(mu, "blender_to_mu", {}) or {}
+    if not val:
+        return None
+    hit = mapping.get(val)
+    if hit is not None:
+        return hit
+    val_s = strip_nnn(val)
+    matches = []
+    seen = set()
+    for bname, mobj in mapping.items():
+        if mobj is None:
+            continue
+        ptr = id(mobj)
+        if ptr in seen:
+            continue
+        # Only Blender's .001 uniquifier of the *same* datablock, not ht2 vs ht2_JEM
+        if bname.startswith(val + ".") or val.startswith(bname + "."):
+            seen.add(ptr)
+            matches.append(mobj)
+            continue
+        if val_s and strip_nnn(bname) == val_s:
+            seen.add(ptr)
+            matches.append(mobj)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _merge_animation_clips(dst, src):
+    """Append src clips into dst, combining curves when names already exist."""
+    if dst is None or src is None:
+        return dst
+    existing = {}
+    for clip in getattr(dst, "clips", None) or []:
+        existing[clip.name] = clip
+    for clip in getattr(src, "clips", None) or []:
+        prev = existing.get(clip.name)
+        if prev is None:
+            dst.clips.append(clip)
+            existing[clip.name] = clip
+        else:
+            prev.curves.extend(clip.curves)
+    if not getattr(dst, "clip", None) and getattr(src, "clip", None):
+        dst.clip = src.clip
+    return dst
+
+
 def export_object(obj, filepath, bake_active_variant=False):
     animations = collect_animations(obj)
     anim_root = find_path_root(animations)
@@ -343,13 +392,7 @@ def export_object(obj, filepath, bake_active_variant=False):
             isinstance(host_key, tuple) and len(host_key) == 2
         ) else ("path", host_key)
         if kind == "bobj":
-            target = getattr(mu, "blender_to_mu", {}).get(val)
-            if target is None:
-                # Name may have been remapped; try strip_nnn / prefix match
-                for bname, m in getattr(mu, "blender_to_mu", {}).items():
-                    if bname == val or bname.startswith(val + ".") or val.startswith(bname):
-                        target = m
-                        break
+            target = _mu_target_for_blender_name(mu, val)
             if target is not None:
                 target_path = getattr(target, "path", None) or anim_root
         else:
@@ -362,9 +405,7 @@ def export_object(obj, filepath, bake_active_variant=False):
             target_path = getattr(target, "path", None) or anim_root or ""
         new_anim = make_animations(mu, host_anims, target_path)
         if hasattr(target, "animation") and target.animation and target.animation.clips:
-            target.animation.clips.extend(new_anim.clips)
-            if not target.animation.clip and new_anim.clip:
-                target.animation.clip = new_anim.clip
+            _merge_animation_clips(target.animation, new_anim)
         else:
             target.animation = new_anim
     mu.write(filepath)

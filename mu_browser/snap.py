@@ -228,7 +228,12 @@ class KSPMU_OT_LikeKspPlace(bpy.types.Operator):
     """Ghost-follow cursor until LMB; then snap if near a node."""
     bl_idname = "object.ksp_mu_like_ksp_place"
     bl_label = "Place Part (like KSP)"
+    bl_description = "Place the imported part under the cursor (LMB snap, RMB/Esc cancel)"
     bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def description(cls, context, properties):
+        return cls.bl_description
 
     def modal(self, context, event):
         root = context.view_layer.objects.active
