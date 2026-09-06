@@ -27,25 +27,54 @@ def swizzleq(quaternion):
     return quaternion[1], quaternion[3], quaternion[2], -quaternion[0]
 
 def strip_nnn(name):
-    # ∧ separates the export name from the modeling name
-    ind = name.rfind("∧")
-    if ind >= 0:
-        base = name[:ind]
-        # iROSA_attach.001∧ → iROSA_attach (Blender uniquifier, not Unity name)
+    """Strip Blender-only protection marks; keep legitimate Unity wedge names.
+
+    Stock parts (e.g. bluedog_Surveyor_Omnis) use real transform names like
+    Omni1 wedge. Import then appends a trailing protection mark:
+
+    - Omni1 wedge + wedge -> Blender double-wedge -> export Omni1 wedge
+    - Name + wedge -> Name wedge -> export Name
+    - Name.001 wedge -> Name
+    - Name wedge .001 -> Name
+    - Parent wedge collider / Omni1 wedge wedge collider -> strip only the
+      wedge-collider import tag
+
+    Never cut at the first wedge as if it were always a protection mark --
+    that destroyed Surveyor Omni1 wedge nodes whose Unity name contains wedge.
+    """
+    import re
+    name = str(name or "")
+    if not name:
+        return name
+    wedge = "∧"
+
+    # 1) Import mesh-collider tag at the end: ... wedge collider[.NNN]
+    m = re.match(
+        r"^(.*)" + re.escape(wedge) + r"collider(\.\d{3})?$",
+        name,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1) if m.group(1) else name
+
+    # 2) Trailing protection mark only: UnityName wedge or UnityName.001 wedge
+    if name.endswith(wedge):
+        base = name[:-1]
         dot = base.rfind(".")
         if dot >= 0 and len(base) - dot == 4 and base[dot + 1:].isdigit():
             base = base[:dot]
         return base
-    # legacy check for blender's duplicate name separator
-    # causes problems for naming schemes that includ the part size
-    # but forcing people to add ∧ after all their objects isn't a
-    # great idea, so it's useful anyway.
+
+    # 3) Protection mark then Blender uniquifier: UnityName wedge .001
+    m = re.match(r"^(.*)" + re.escape(wedge) + r"(\.\d{3})$", name)
+    if m:
+        return m.group(1)
+
+    # 4) Legacy Blender duplicate without mark: Name.001
     ind = name.rfind(".")
-    if ind < 0 or len(name) - ind != 4:
-        return name
-    if not name[ind+1:].isdigit():
-        return name
-    return name[:ind]
+    if ind >= 0 and len(name) - ind == 4 and name[ind + 1:].isdigit():
+        return name[:ind]
+    return name
 
 
 def normalize_mu_curve_path(path):
@@ -57,7 +86,11 @@ def normalize_mu_curve_path(path):
 
 
 def unity_export_name(obj):
-    """Unity ``transform.name`` for .mu export (exact stock name when stored)."""
+    """Unity transform.name for .mu export (exact stock name when stored).
+
+    mu_unity_transform_name is written on import from the .mu and may
+    legitimately contain wedge (Surveyor Omni1 wedge). Never run strip_nnn on it.
+    """
     if obj is None:
         return ""
     try:

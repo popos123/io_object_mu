@@ -27,7 +27,10 @@ from ..mu import Mu
 from ..mu import MuObject, MuTransform, MuTagLayer
 from ..utils import strip_nnn, collect_collections, unity_export_name
 
-from .animation import collect_animations, find_path_root, make_animations, group_animations_by_host
+from .animation import (
+    collect_animations, collect_orphan_stub_animations,
+    find_path_root, make_animations, group_animations_by_host,
+)
 from .collider import make_collider
 from .cfgfile import generate_cfg
 from .export_util import is_collider
@@ -101,7 +104,23 @@ def find_single_collider(objects):
 def make_obj_core(mu, obj, path, muobj):
     if path:
         path += "/"
-    path += muobj.transform.name
+    # Disambiguate sibling Unity names after strip_nnn (Omni1∧ + Omni1∧collider
+    # used to both become Omni1 and overwrite object_paths / drop content —
+    # bluedog_Surveyor_Omnis).
+    leaf = muobj.transform.name or "object"
+    candidate = path + leaf
+    if candidate in mu.object_paths:
+        n = 1
+        while True:
+            alt = "%s.%03d" % (leaf, n)
+            if path + alt not in mu.object_paths:
+                leaf = alt
+                muobj.transform.name = leaf
+                break
+            n += 1
+            if n > 999:
+                break
+    path = path + leaf
     muobj.path = path
     mu.object_paths[path] = muobj
     # Unique Blender name → MuObject (duplicate Unity sibling names collide in
@@ -168,6 +187,15 @@ def make_obj_core(mu, obj, path, muobj):
                 or o.get("mu_fx_preview")):
             mu.exported_objects.add(o)
             continue
+        # Anim-only stubs from import (missing/garbage Unity paths). Keep NLA
+        # for curve export via collect_animations; never emit as MuObjects so
+        # hierarchy matches the original .mu (ladder-2 tanks/colliders etc.).
+        try:
+            if o.get("mu_anim_stub"):
+                mu.exported_objects.add(o)
+                continue
+        except Exception:
+            pass
         # Export Active Variant: omit GAMEOBJECTS branches hidden by preview
         if getattr(mu, "bake_active_variant", False) and o.get("mu_variant_hidden"):
             mu.exported_objects.add(o)
@@ -322,6 +350,7 @@ def _merge_animation_clips(dst, src):
 
 def export_object(obj, filepath, bake_active_variant=False):
     animations = collect_animations(obj)
+    collect_orphan_stub_animations(obj, animations)
     anim_root = find_path_root(animations)
     mu = Mu()
     mu.exported_objects = set()

@@ -529,10 +529,8 @@ class MuMesh:
                 tris = []
                 for i in range(int(num_tris / 3)):  # Unity stores 3 indices per tri
                     tri = mu.read_int(3)
-                    #reverse the triangle winding for Blender (because of the
-                    # LHS/RHS swap)
-                    #avoid putting 0 at the end of the list (Blender doesn't
-                    #like that)
+                    #reverse the triangle winding for Blender (because of the LHS/RHS swap)
+                    #avoid putting 0 at the end of the list (Blender doesn't like that)
                     if not tri[0]:
                         tri = tri[0], tri[2], tri[1]
                     else:
@@ -588,8 +586,7 @@ class MuMesh:
             mu.write_int(MuEnum.ET_MESH_TRIANGLES)
             mu.write_int(len(sm) * 3)
             for tri in sm:
-                #reverse the triangle winding for Blender (because of the
-                # LHS/RHS swap)
+                #reverse the triangle winding for Blender (because of the LHS/RHS swap)
                 tri = tri[0], tri[2], tri[1]
                 mu.write_int(tri)
         mu.write_int(MuEnum.ET_MESH_END)
@@ -1113,12 +1110,14 @@ class Mu:
         data = self.file.read(size)
         if len(data) < size:
             raise EOFError
-        if type(data) == type(""):
+        if isinstance(data, str):
             return data
-        s = ""
-        for c in data:
-            s = s + chr(c)
-        return s
+        # PartTools / Unity write UTF-8
+        # Decoding byte-by-byte (chr) produced mojibake and broke Surveyor
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data.decode("latin-1")
 
     def write_byte(self, data):
         if not hasattr(data, "__len__"):
@@ -1182,10 +1181,13 @@ class Mu:
             self.file.write(bytes(size - len(data)))
 
     def write_string(self, data, size=-1):
-        data = data.encode()
-        size = len(data)
+        if isinstance(data, bytes):
+            raw = data
+        else:
+            raw = data.encode("utf-8")
+        size = len(raw)
         self.write_7int(size)
-        self.write_bytes(data, size)
+        self.write_bytes(raw, size)
 
     def __init__(self, name = "mu"):
         self.name = name

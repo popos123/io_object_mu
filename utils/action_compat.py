@@ -95,6 +95,14 @@ def fcurve_new(action, datablock, data_path, index=0):
 
 def push_action_to_nla(obj, action, track_name):
     """Create an NLA track/strip for action on obj (Blender 4/5 safe)."""
+    try:
+        _ = obj.name
+        if not hasattr(obj, "animation_data"):
+            print("WARNING: push_action_to_nla: not an Object (%r)" % (type(obj),))
+            return None, None
+    except ReferenceError:
+        print("WARNING: push_action_to_nla skipped — Object already removed")
+        return None, None
     if not obj.animation_data:
         obj.animation_data_create()
     ad = obj.animation_data

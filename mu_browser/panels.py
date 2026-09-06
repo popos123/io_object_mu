@@ -472,7 +472,12 @@ def _objects_of_mu_import(import_id):
 
 
 def _count_import_roots(import_id):
-    """Top-level Blender objects belonging to one mu_import_id (panel Roots)."""
+    """Top-level Blender objects belonging to one mu_import_id (panel Roots).
+
+    Animation-only stubs (``mu_anim_stub``) created for missing curve paths
+    are never counted — they exist only to host NLA and must not inflate
+    Roots after reimport (Beacon1 1→6 regression).
+    """
     if not import_id:
         return 0
     roots = 0
@@ -483,6 +488,11 @@ def _count_import_roots(import_id):
                 continue
         except Exception:
             continue
+        try:
+            if obj.get("mu_anim_stub"):
+                continue
+        except Exception:
+            pass
         try:
             ptr = obj.as_pointer()
         except Exception:

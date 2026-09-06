@@ -401,6 +401,84 @@ def create_fcurve(action, curve, propmap, datablock, rest_value=None):
         _write_kp(i + off, x, y, tan_in, tan_out, dist_in, dist_out)
     return fc
 
+
+_GARBAGE_PATH_MARKERS = (
+    "|mesh:",
+    "|Dupli|",
+    "Dupli|",
+)
+
+
+def _is_garbage_anim_path(mu_path: str) -> bool:
+    """Paths that must never become hierarchy nodes (Blender Dupli / mesh tags)."""
+    p = mu_path or ""
+    if not p:
+        return False
+    for m in _GARBAGE_PATH_MARKERS:
+        if m in p:
+            return True
+    leaf = p.rstrip("/").split("/")[-1]
+    if leaf.startswith("mesh:"):
+        return True
+    return False
+
+
+def _resolve_existing_anim_target(mu, mu_path: str, host_path: str = ""):
+    """Map a Unity curve path to an existing MuObject without creating stubs.
+
+    Order:
+      1. exact key in object_paths
+      2. host_path + relative path
+      3. any object_paths entry ending with the relative path
+      4. unique leaf-name match under the host prefix
+    """
+    if not mu_path:
+        return None, ""
+    if mu_path in mu.object_paths:
+        return mu.object_paths[mu_path], mu_path
+    rel = (host_path + "/" + mu_path) if host_path else mu_path
+    if rel in mu.object_paths:
+        return mu.object_paths[rel], rel
+    cpath = mu_path.rstrip("/")
+    matches = [
+        p for p in mu.object_paths
+        if p == cpath or p.endswith("/" + cpath)
+    ]
+    if len(matches) == 1:
+        return mu.object_paths[matches[0]], matches[0]
+    leaf = cpath.split("/")[-1]
+    if leaf:
+        leaf_hits = []
+        for p, obj in mu.object_paths.items():
+            if p.rsplit("/", 1)[-1] != leaf:
+                continue
+            if host_path and not (p == host_path or p.startswith(host_path + "/")):
+                continue
+            leaf_hits.append(p)
+        if len(leaf_hits) == 1:
+            return mu.object_paths[leaf_hits[0]], leaf_hits[0]
+    return None, ""
+
+
+def _orphan_attach_host(mu, host_path: str):
+    """MuObject that owns the Animation component (fallback for orphan curves)."""
+    if host_path and host_path in mu.object_paths:
+        return mu.object_paths[host_path], host_path
+    parts = [s for s in (host_path or "").split("/") if s]
+    while parts:
+        p = "/".join(parts)
+        if p in mu.object_paths:
+            return mu.object_paths[p], p
+        parts.pop()
+    for p, obj in mu.object_paths.items():
+        if getattr(obj, "animation", None) is not None:
+            return obj, p
+    if mu.object_paths:
+        p = next(iter(mu.object_paths))
+        return mu.object_paths[p], p
+    return None, ""
+
+
 def _ensure_path_object(mu, mu_path):
     """Create stub MuObjects + Blender empties for clip paths missing in the .mu hierarchy."""
     if mu_path in mu.object_paths:
@@ -432,16 +510,59 @@ def _ensure_path_object(mu, mu_path):
         stub.components = []
         stub.path = p
         stub.parent = parent
-        stub.force_import = True
+        # Anim-only: never force into exported hierarchy (non-destructive).
+        stub.force_import = False
         stub.mu = mu
         col = getattr(mu, "collection", None) or bpy.context.scene.collection
         bobj = bpy.data.objects.new(part, None)
         bobj.empty_display_type = 'PLAIN_AXES'
+        try:
+            bobj.empty_display_size = 0.01
+        except Exception:
+            pass
         col.objects.link(bobj)
-        if parent is not None and getattr(parent, "bobj", None):
-            bobj.parent = parent.bobj
-        elif parent is not None and getattr(parent, "armature_obj", None):
-            bobj.parent = parent.armature_obj
+        # Prefer empty host, then control/bindPose armature, then walk
+        # ancestors — bone-only MuObjects have neither bobj nor armature_obj,
+        # which left TriBitDrill's ``shake`` as a second import root.
+        parent_bl = None
+        if parent is not None:
+            parent_bl = getattr(parent, "bobj", None) or getattr(
+                parent, "armature_obj", None)
+            if parent_bl is None:
+                walk = parent
+                while walk is not None and parent_bl is None:
+                    parent_bl = getattr(walk, "bobj", None) or getattr(
+                        walk, "armature_obj", None)
+                    walk = getattr(walk, "parent", None)
+        if parent_bl is None:
+            # Orphan stubs become extra import roots (Beacon1 1→6). Attach under
+            # the nearest non-stub object of this import, or the collection root.
+            try:
+                iid = str(getattr(mu, "import_id", "") or "")
+                for o in bpy.data.objects:
+                    try:
+                        if iid and str(o.get("mu_import_id") or "") != iid:
+                            continue
+                        if o.get("mu_anim_stub"):
+                            continue
+                    except Exception:
+                        continue
+                    if o is bobj:
+                        continue
+                    # Prefer a true top-level model object
+                    try:
+                        if o.parent is None or str(
+                                getattr(o.parent, "get", lambda *_: None)(
+                                    "mu_import_id") or "") != iid:
+                            parent_bl = o
+                            break
+                    except Exception:
+                        parent_bl = o
+                        break
+            except Exception:
+                parent_bl = None
+        if parent_bl is not None:
+            bobj.parent = parent_bl
         stub.bobj = bobj
         try:
             # Stubs keep clip curves for round-trip but must not affect
@@ -449,6 +570,9 @@ def _ensure_path_object(mu, mu_path):
             bobj["mu_anim_stub"] = 1
             bobj.hide_render = True
             bobj.hide_viewport = True
+            bobj.hide_set(True)
+            if getattr(mu, "import_id", None):
+                bobj["mu_import_id"] = str(mu.import_id)
         except Exception:
             pass
         mu.object_paths[p] = stub
@@ -519,17 +643,48 @@ def _ensure_anim_object_host(mu, mu_path, muobj):
         bobj["mu_anim_stub"] = 1
         bobj.hide_render = True
         bobj.hide_viewport = True
+        try:
+            bobj.hide_set(True)
+        except Exception:
+            pass
     except Exception:
         pass
-    parent_bobj = None
+    parent_bl = None
     parts = (mu_path or "").split("/")
     for i in range(len(parts) - 1, 0, -1):
         anc = mu.object_paths.get("/".join(parts[:i]))
-        if anc is not None and getattr(anc, "bobj", None):
-            parent_bobj = anc.bobj
+        if anc is None:
+            continue
+        parent_bl = getattr(anc, "bobj", None) or getattr(
+            anc, "armature_obj", None)
+        if parent_bl is not None:
             break
-    if parent_bobj is not None:
-        bobj.parent = parent_bobj
+    if parent_bl is None:
+        # Same fallback as _ensure_path_object — never leave anim hosts as
+        # extra import roots (Beacon1).
+        try:
+            iid = str(getattr(mu, "import_id", "") or "")
+            for o in bpy.data.objects:
+                try:
+                    if iid and str(o.get("mu_import_id") or "") != iid:
+                        continue
+                    if o.get("mu_anim_stub"):
+                        continue
+                except Exception:
+                    continue
+                if o is bobj:
+                    continue
+                parent_bl = o
+                break
+        except Exception:
+            parent_bl = None
+    if parent_bl is not None:
+        bobj.parent = parent_bl
+    try:
+        if getattr(mu, "import_id", None):
+            bobj["mu_import_id"] = str(mu.import_id)
+    except Exception:
+        pass
     try:
         muobj.bobj = bobj
     except Exception:
@@ -645,30 +800,59 @@ def create_action(mu, path, clip, host=None):
                     # mesh has a different bind pose — rebase rotation later.
                     path_retarget = True
             if mu_path not in mu.object_paths:
-                # Synthesize missing hierarchy nodes referenced by clips (lights,
-                # shake empties, colliders with odd names, etc.)
-                muobj = _ensure_path_object(mu, mu_path)
-                if muobj is None:
-                    if not hasattr(mu, "bad_paths"):
-                        mu.bad_paths = set()
-                    if mu_path not in mu.bad_paths:
-                        mu.bad_paths.add(mu_path)
-                        print("Unknown path: %s" % (mu_path))
-                    continue
+                # Non-destructive: resolve existing GO, orphan garbage paths on
+                # the Animation host, else hidden stub (not written to .mu tree).
+                resolved_obj, resolved_path = _resolve_existing_anim_target(
+                    mu, curve.path or mu_path, path or "")
+                if resolved_obj is not None:
+                    muobj = resolved_obj
+                    mu_path = resolved_path
+                elif _is_garbage_anim_path(curve.path or mu_path or ""):
+                    muobj, mu_path_host = _orphan_attach_host(mu, path or "")
+                    if muobj is None:
+                        if not hasattr(mu, "bad_paths"):
+                            mu.bad_paths = set()
+                        if mu_path not in mu.bad_paths:
+                            mu.bad_paths.add(mu_path)
+                            print("INFO: Skip garbage anim path (no host): %s"
+                                  % (curve.path or mu_path))
+                        continue
+                    mu_path = mu_path_host
+                    # Do NOT set path_retarget — that skips loc/scale keys.
+                    # Orphan curves keep all channels on the host Action.
+                else:
+                    muobj = _ensure_path_object(mu, mu_path)
+                    if muobj is None:
+                        muobj, mu_path_host = _orphan_attach_host(mu, path or "")
+                        if muobj is None:
+                            if not hasattr(mu, "bad_paths"):
+                                mu.bad_paths = set()
+                            if mu_path not in mu.bad_paths:
+                                mu.bad_paths.add(mu_path)
+                                print("Unknown path: %s" % (mu_path))
+                            continue
+                        mu_path = mu_path_host
             else:
                 muobj = mu.object_paths[mu_path]
-            if curve.path:
+            if curve.path and not path_retarget:
                 leaf = curve.path.rstrip("/").split("/")[-1]
                 try:
                     mname = str(getattr(getattr(muobj, "transform", None), "name", "") or "")
                 except Exception:
                     mname = ""
                 if leaf and mname and mname != leaf:
+                    # Prefer resolve before creating alt stubs
                     alt_path = "/".join([p for p in (path, curve.path) if p])
-                    alt = _ensure_path_object(mu, alt_path)
-                    if alt is not None:
-                        muobj = alt
-                        mu_path = alt_path
+                    alt_obj, alt_resolved = _resolve_existing_anim_target(
+                        mu, curve.path, path or "")
+                    if alt_obj is not None:
+                        muobj = alt_obj
+                        mu_path = alt_resolved
+                    elif not _is_garbage_anim_path(alt_path):
+                        alt = _ensure_path_object(mu, alt_path)
+                        if alt is not None:
+                            muobj = alt
+                            mu_path = alt_path
             # Multi-segment clip path bound to a GO whose hierarchy path does
             # not end with that clip path (capsule/hatch → …/hatch): retarget.
             cpath = (curve.path or "").rstrip("/")
@@ -702,12 +886,27 @@ def create_action(mu, path, clip, host=None):
         elif hasattr(muobj, "bobj") and muobj.bobj:
             obj = muobj.bobj
         else:
-            # Animated node without mesh/collider — synthesize an empty host
+            # Animated node without mesh/collider — synthesize an empty host.
+            # Must use _ensure_anim_object_host so the empty is tagged
+            # mu_anim_stub, gets mu_import_id, and is parented under the model.
+            # A bare bpy.data.objects.new left unparented top-level empties
+            # that inflated Roots after reimport (Beacon1 1→6).
             print("INFO: No blender object at path: %s (creating empty)" % (mu_path))
-            col = getattr(mu, "collection", None) or bpy.context.scene.collection
-            obj = bpy.data.objects.new(muobj.transform.name, None)
-            col.objects.link(obj)
-            muobj.bobj = obj
+            obj = _ensure_anim_object_host(mu, mu_path, muobj)
+            if obj is None:
+                col = getattr(mu, "collection", None) or bpy.context.scene.collection
+                name = getattr(getattr(muobj, "transform", None), "name", None) or "anim"
+                obj = bpy.data.objects.new(str(name), None)
+                col.objects.link(obj)
+                try:
+                    obj["mu_anim_stub"] = 1
+                    obj.hide_render = True
+                    obj.hide_viewport = True
+                    if getattr(mu, "import_id", None):
+                        obj["mu_import_id"] = str(mu.import_id)
+                except Exception:
+                    pass
+                muobj.bobj = obj
         if curve.property[:-2] == "localEulerAnglesRaw":
             obj.rotation_mode = 'YXZ'
         is_shader_curve = False
@@ -737,19 +936,47 @@ def create_action(mu, path, clip, host=None):
             propmap = property_map[curve.property]
             subpath, propmap = propmap[0], propmap[1:]
         fullpropmap = (dppref + propmap[0],) + propmap[1:3]
+        # Blender Object that owns NLA. Light curves must stay on the Object
+        # (data_path "data.energy" etc.) — never on the Light datablock alone,
+        # or export collects Object NLA + Light.action and reimport doubles
+        # clips as "Spot Light.data" rows (LTV / GeminiInt2 regression).
+        nla_owner = obj
         if subpath != "obj":
             data = getattr(obj, subpath, None)
             # Light curves need a Light datablock. Blender Empties cannot hold
             # lights (Object.data only accepts Image/None for EMPTY).
-            if subpath == "data" and obj.type == 'EMPTY':
-                light, new_obj = _convert_empty_to_light(obj, 'SPOT')
-                if getattr(muobj, "bobj", None) is obj:
-                    muobj.bobj = new_obj
-                obj = new_obj
-                if "mu_light_enabled" not in obj:
-                    obj["mu_light_enabled"] = 1.0
-                data = light
-            obj = data
+            if subpath == "data":
+                if obj.type == 'EMPTY':
+                    old_obj = obj
+                    light, new_obj = _convert_empty_to_light(obj, 'SPOT')
+                    if getattr(muobj, "bobj", None) is old_obj:
+                        muobj.bobj = new_obj
+                    try:
+                        for _p, _mo in list(getattr(mu, "object_paths", {}).items()):
+                            if getattr(_mo, "bobj", None) is old_obj:
+                                _mo.bobj = new_obj
+                    except Exception:
+                        pass
+                    for _k, (_act, _o) in list(actions.items()):
+                        if _o is old_obj:
+                            actions[_k] = (_act, new_obj)
+                    obj = new_obj
+                    nla_owner = new_obj
+                    if "mu_light_enabled" not in obj:
+                        obj["mu_light_enabled"] = 1.0
+                    data = light
+                elif obj.type == 'LIGHT':
+                    nla_owner = obj
+                    data = obj.data
+                if data is None:
+                    print(f"{mu_path}: skip curve {curve.property} — no light datablock")
+                    continue
+                # Animate through the Object: data_path "data.energy" / "data.color"
+                # so one Action+NLA on the Object round-trips without .data splits.
+                fullpropmap = (dppref + "data." + propmap[0],) + propmap[1:3]
+                # keep obj = Object (nla_owner); do NOT switch to Light datablock
+            else:
+                obj = data
         if obj is None:
             print(f"{mu_path}: skip curve {curve.property} — no datablock")
             continue
@@ -769,26 +996,79 @@ def create_action(mu, path, clip, host=None):
             host_name = ""
         if not host_name:
             host_name = (muobj.bobj.name if getattr(muobj, "bobj", None)
-                         else getattr(obj, "name", "obj"))
-        if is_shader_curve or is_audio_curve:
-            # Keep material/audio curves off transform actpaths — mixed Actions
-            # only NLA-push to the last curve's owner and shader export skips them.
-            objname = ".".join([host_name, "mat"])
+                         else getattr(nla_owner, "name", None)
+                         or getattr(obj, "name", "obj"))
+        if is_audio_curve:
+            # Own bucket — sharing "mat" with shader curves lost the single
+            # AudioSource fcurve on GeminiInt2 reimport (Aud 1→0, Curves 17→16).
+            kind = "aud"
+        elif is_shader_curve:
+            # Keep material curves off transform actpaths.
+            kind = "mat"
+        elif subpath == "data":
+            # Dedicated light bucket (not ".data" panel rows, not merged with
+            # transform on the same GO).
+            kind = "lit"
         else:
-            objname = ".".join([host_name, subpath])
-        if mu_path:
+            kind = subpath or "obj"
+        # Prefer Unity ``curve.path`` so progressive resolve/retarget of
+        # ``mu_path`` does not split one target's quaternion into 2 Actions
+        # (1+3 fcurves) — that inflated Clips= on first import and dropped
+        # after merge on reexport (mk1Pod, sspx docking, TriBit Impact…).
+        unity_rel = (curve.path or "").strip()
+        if unity_rel:
+            act_base = unity_rel
+        elif mu_path:
             act_base = str(mu_path).strip()
         else:
-            act_base = (curve.path or "").strip() or path or ""
-        actpath = "/".join([act_base, objname])
+            act_base = path or ""
+        # Export writes curve paths relative to the Animation host. First import
+        # of a stock .mu often keeps absolute / longer paths → extra actpath
+        # keys; reimport of our export uses relative paths → fewer Actions
+        # (GeminiInt2 Clips 9→8, Curves=17). Normalize to host-relative form.
+        host_path = (path or "").strip().rstrip("/")
+        if host_path and act_base:
+            if act_base == host_path:
+                act_base = ""
+            elif act_base.startswith(host_path + "/"):
+                act_base = act_base[len(host_path) + 1:]
+            else:
+                leaf = host_path.rsplit("/", 1)[-1]
+                if leaf and act_base.startswith(leaf + "/"):
+                    act_base = act_base[len(leaf) + 1:]
+                elif leaf and act_base == leaf:
+                    act_base = ""
+        # Stable key: relative unity path + kind (no host_name — renames on Light).
+        actpath = "/".join([act_base or "_root", kind])
+        # Human-readable Action name still includes host for the panel.
+        objname = ".".join([str(host_name or "obj"), kind])
         if actpath not in actions:
             act = bpy.data.actions.new(objname)
-            actions[actpath] = act, obj
+            owner_for_nla = nla_owner
+            if owner_for_nla is None or not hasattr(owner_for_nla, "animation_data"):
+                owner_for_nla = getattr(muobj, "bobj", None)
+            if owner_for_nla is None:
+                owner_for_nla = obj
+            actions[actpath] = act, owner_for_nla
             try:
                 act["mu_unity_curve_path"] = curve.path or ""
             except Exception:
                 pass
-        act, obj = actions[actpath]
+            try:
+                # Lossless export path for missing/garbage Unity targets
+                if _is_garbage_anim_path(curve.path or ""):
+                    act["mu_orphan_curve"] = 1
+                elif getattr(owner_for_nla, "get", None) and owner_for_nla.get("mu_anim_stub"):
+                    act["mu_orphan_curve"] = 1
+                elif mu_path and mu_path in mu.object_paths:
+                    mo = mu.object_paths[mu_path]
+                    b = getattr(mo, "bobj", None)
+                    if b is not None and b.get("mu_anim_stub"):
+                        act["mu_orphan_curve"] = 1
+            except Exception:
+                pass
+        act, _stored_owner = actions[actpath]
+        # create_fcurve: obj is Object (light via data.*) or datablock (mat)
         if is_shader_curve or is_audio_curve:
             # Preserve Unity renderer-relative path (shared materials may be
             # attached to a different mesh than the clip path, e.g. obj_gimbal).
@@ -1001,6 +1281,52 @@ def create_action(mu, path, clip, host=None):
     except Exception:
         pass
 
+    # When every curve was skipped (missing targets, empty keys, unsupported
+    # props) the panel still needs a tagged Action so mutate/export can round-
+    # trip clip name + wrap + autoPlay (Combined / LR87 / Viking Propulsion).
+    if not actions:
+        holder = host_bobj
+        if holder is None and host is not None:
+            holder = getattr(host, "bobj", None)
+        if holder is None:
+            try:
+                holder = _ensure_anim_object_host(mu, path or "", host)
+            except Exception:
+                holder = None
+        if holder is not None:
+            try:
+                act = bpy.data.actions.new(str(clip.name or "clip") or "clip")
+                actions["__meta__/" + str(clip.name or "clip")] = act, holder
+            except Exception:
+                pass
+
+    # Drop Actions that ended up with zero fcurves when the clip already has
+    # real curves. A failed create_fcurve after actpath allocation left empty
+    # NLA rows that inflated Clips= on first import and vanished on reimport
+    # (GeminiInt2 9→8 with Curves=17 stable). Keep a lone meta Action (LR87).
+    try:
+        from ..utils.action_compat import count_action_fcurves as _ncurves
+    except Exception:
+        def _ncurves(a):
+            try:
+                return len(list(a.fcurves))
+            except Exception:
+                return 0
+    nonempty = {
+        k: (a, o) for k, (a, o) in actions.items()
+        if a is not None and int(_ncurves(a) or 0) > 0
+    }
+    if nonempty:
+        # Remove empty Actions from bpy so they do not linger in the .blend
+        for k, (a, o) in list(actions.items()):
+            if k in nonempty:
+                continue
+            try:
+                bpy.data.actions.remove(a)
+            except Exception:
+                pass
+        actions = nonempty
+
     clip_len = 0.0
     try:
         clip_len = float(actions_clip_length([a for a, _o in actions.values()]) or 0)
@@ -1009,6 +1335,40 @@ def create_action(mu, path, clip, host=None):
 
     for name in actions:
         act, obj = actions[name]
+        # Resolve live Object (Empty may have been replaced by LIGHT mid-loop)
+        try:
+            _ = obj.name
+            _ = obj.animation_data
+        except ReferenceError:
+            fixed = None
+            try:
+                bname = act.get("mu_nla_owner") or act.get("mu_anim_bobj")
+                if bname:
+                    fixed = bpy.data.objects.get(str(bname))
+            except Exception:
+                fixed = None
+            if fixed is None and host is not None:
+                fixed = getattr(host, "bobj", None)
+            if fixed is None:
+                print("WARNING: skip NLA push — owner Object was removed (%r)" % (name,))
+                continue
+            obj = fixed
+            actions[name] = act, obj
+        except Exception:
+            # Not an Object (e.g. leftover Light datablock) — try host / muobj
+            fixed = None
+            if host is not None:
+                fixed = getattr(host, "bobj", None)
+            if fixed is None:
+                try:
+                    fixed = bpy.data.objects.get(str(getattr(obj, "name", "") or ""))
+                except Exception:
+                    fixed = None
+            if fixed is None:
+                print("WARNING: skip NLA push — no Object owner (%r)" % (name,))
+                continue
+            obj = fixed
+            actions[name] = act, obj
         # Remember which Mu hierarchy node owned this Animation component so
         # export can restore multiple MuAnimation hosts (nested clips).
         try:
@@ -1284,9 +1644,7 @@ def _summary_stats_for_generation(gen):
 
 
 def _summary_host_label(ent):
-    """Unity host name for INFO (strip Blender ``∧`` / ``.NNN``)."""
     from ..utils import strip_nnn
-
     def _clean(name):
         name = str(name or "")
         if not name:
@@ -1295,31 +1653,90 @@ def _summary_host_label(ent):
             return strip_nnn(name) or name
         except Exception:
             return name
-
+    # Prefer authored Unity host path leaf (stable across export rename)
+    path = str(ent.get("anim_host") or "")
+    if path:
+        leaf = _clean(path.rstrip("/").split("/")[-1])
+        if leaf:
+            return leaf
     bobj = _clean(ent.get("anim_bobj") or "")
     if bobj:
         return bobj
-    path = str(ent.get("anim_host") or "")
-    if path:
-        leaf = path.rstrip("/").split("/")[-1]
-        leaf = _clean(leaf)
-        if leaf:
-            return leaf
-    owner = _clean(ent.get("owner") or "")
-    return owner or "host"
+    return _clean(ent.get("owner") or "") or "host"
 
 
-def format_mu_animation_summary(gen=None):
-    """Return the compact INFO one-liner (panel rows + AP / clip wrap / curve wrap).
+def _classify_fcurve_data_path(data_path):
+    """Return one of: 'xf' | 'mat' | 'lit' | 'aud' | 'bone' | 'other'."""
+    dp = (data_path or "").strip()
+    if not dp:
+        return "other"
+    if "mu_audio_" in dp:
+        return "aud"
+    if dp.startswith("mumatprop.") or ".mumatprop." in dp:
+        return "mat"
+    if dp.startswith("pose.bones"):
+        return "bone"
+    # Light datablock paths (energy / color) or Object-space data.* / enabled
+    if (dp in ("energy", "color") or dp.startswith("color")
+            or dp.startswith("data.energy") or dp.startswith("data.color")
+            or "mu_light_enabled" in dp):
+        return "lit"
+    # Transform on Object
+    if dp in ("location", "rotation_quaternion", "rotation_euler", "scale"):
+        return "xf"
+    return "other"
 
-    Roots/Hosts/Clips/Curves follow the MU Animation panel header.
-    Clips = one NLA Action row (not unique Unity MuClip names).
 
-    The tail stacks identical panel rows like the Animation list:
-    ``host.clip AP=…`` or ``host.clip=N AP=…`` when N>1.
-    Host is in the label because two Animation GOs may share a clip name.
-    Auto Play is per host. WM is per (host, MuClip). CW is per Action;
-    rows with different CW do not stack.
+def _curve_type_counts_from_entries(entries):
+    """Count fcurves by Mu/Unity channel class across panel entries."""
+    from collections import Counter
+    from ..utils.action_compat import iter_action_fcurves
+    counts = Counter()
+    for ent in entries:
+        act = ent.get("action")
+        if act is None:
+            continue
+        try:
+            for fc in iter_action_fcurves(act):
+                if fc is None:
+                    continue
+                counts[_classify_fcurve_data_path(getattr(fc, "data_path", "") or "")] += 1
+        except Exception:
+            pass
+    return counts
+
+
+def _preview_counts_for_import_id(import_id):
+    """Viewport-only preview Actions (not written to .mu)."""
+    fx = lit = rob = 0
+    if not import_id:
+        return fx, lit, rob
+    try:
+        from ..mu_browser.panels import (
+            collect_mu_preview_entries_by_import_id,
+            _preview_section_of,
+        )
+        for ent in collect_mu_preview_entries_by_import_id(import_id) or []:
+            sec = _preview_section_of(ent)
+            if sec == "lights":
+                lit += 1
+            elif sec == "robotics":
+                rob += 1
+            else:
+                fx += 1
+    except Exception:
+        pass
+    return fx, lit, rob
+
+
+def format_mu_animation_summary(gen=None, include_preview=True):
+    """Compact INFO one-liner for panel rows + AP / clip wrap / curve wrap.
+
+    Header (MuAnimation round-trip contract):
+      Roots= Hosts= Clips= Curves= Xf= Mat= Lit= Aud= [Bone=]
+    Optional second field (viewport only, not in .mu):
+      FX= LitP= Rob=
+    Tail: host.clip AP=… WM=… CW=… (stacked =N)
     """
     from collections import OrderedDict
 
@@ -1327,6 +1744,13 @@ def format_mu_animation_summary(gen=None):
         gen = int(MU_IMPORT_GENERATION)
     entries, import_id = _summary_entries_for_generation(gen)
     n_roots, n_hosts, n_clips, n_curves = _stats_from_entries(entries, import_id)
+    type_counts = _curve_type_counts_from_entries(entries)
+    n_xf = int(type_counts.get("xf", 0) + type_counts.get("bone", 0))
+    n_mat = int(type_counts.get("mat", 0))
+    n_lit = int(type_counts.get("lit", 0))
+    n_aud = int(type_counts.get("aud", 0))
+    # Keep Bone visible only when non-zero (armatures); otherwise fold into Xf
+    n_bone = int(type_counts.get("bone", 0))
 
     stacked = OrderedDict()
 
@@ -1364,8 +1788,21 @@ def format_mu_animation_summary(gen=None):
             label = "%s=%d" % (label, n)
         parts.append("%s AP=%s WM=%s CW=%s" % (label, ap, wm, cw))
 
-    prefix = "INFO: Roots=%d Hosts=%d Clips=%d Curves=%d" % (
-        n_roots, n_hosts, n_clips, n_curves)
+    # MuAnimation contract (must survive .mu round-trip)
+    prefix = (
+        "INFO: Roots=%d Hosts=%d Clips=%d Curves=%d Xf=%d Mat=%d Lit=%d Aud=%d"
+        % (n_roots, n_hosts, n_clips, n_curves, n_xf, n_mat, n_lit, n_aud)
+    )
+    if n_bone:
+        # Bone channels are already in Xf; optional explicit tag for debugging
+        prefix = "%s Bone=%d" % (prefix, n_bone)
+
+    # Viewport previews (never written to .mu) — ignored by roundtrip test
+    if include_preview and import_id:
+        fx, lit_p, rob = _preview_counts_for_import_id(import_id)
+        if fx or lit_p or rob:
+            prefix = "%s | FX=%d LitP=%d Rob=%d" % (prefix, fx, lit_p, rob)
+
     if not parts:
         return prefix
     return "%s | %s" % (prefix, " | ".join(parts))

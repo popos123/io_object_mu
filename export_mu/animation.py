@@ -335,9 +335,10 @@ def _mu_export_path(obj, parent_path):
     return seg
 
 def bindpose_object_animations(obj, path):
-    """Object-space Mu clips on bindPose NLA (GrapplingArm OuterSleeve sleeves).
+    """Object-space Mu clips on bindPose NLA (OuterSleeve sleeves, TriBitDrill bone clips).
 
-    Control-armature bone clips may also sit on bindPose after import; skip those.
+    Any Action on bindPose that belongs to a MuClip (has mu_clip_name or mu_anim_host)
+    is exported as object-space, because bindPose is not a control armature.
     """
     animations = {}
     ad = getattr(obj, "animation_data", None)
@@ -356,11 +357,7 @@ def bindpose_object_animations(obj, path):
                 continue
         except Exception:
             continue
-        if not any(
-            not (fc.data_path or "").startswith("pose.bones")
-            for fc in iter_action_fcurves(strip_act)
-        ):
-            continue
+        # All Actions on bindPose that are Mu clips are exported as object-space
         try:
             curve_path = strip_act.get("mu_unity_curve_path") or path
             if curve_path is not None:
@@ -377,6 +374,19 @@ def bindpose_object_animations(obj, path):
 def collect_animations(obj, path=""):
     from .armature import is_bindpose_armature
     animations = {}
+    # Anim stubs are not written to the .mu hierarchy, but their NLA must still
+    # export with the original Unity curve paths (ladder-2 orphan targets etc.).
+    try:
+        if obj.get("mu_anim_stub"):
+            extend_animations(
+                animations, stub_object_animations(obj, path))
+            for o in obj.children:
+                # Children of a stub keep the Unity-relative path context —
+                # do not append the stub's Blender name into the hierarchy path.
+                extend_animations(animations, collect_animations(o, path))
+            return animations
+    except Exception:
+        pass
     path = _mu_export_path(obj, path)
     if type(obj.data) == bpy.types.Armature and is_bindpose_armature(obj):
         extend_animations(animations, bindpose_object_animations(obj, path))
@@ -391,6 +401,69 @@ def collect_animations(obj, path=""):
     for o in obj.children:
         extend_animations(animations, collect_animations(o, path))
     return animations
+
+
+def stub_object_animations(obj, path):
+    """Export NLA on mu_anim_stub empties using stored Unity curve paths.
+
+    ``object_animations`` would pass the parent hierarchy path (or ""), which
+    either misses ``mu_unity_curve_path`` (non-empty parent) or loses the
+    orphan entirely when the stub sits outside the export tree.
+    """
+    animations = {}
+    ad = getattr(obj, "animation_data", None)
+    if not ad:
+        return animations
+    for track in ad.nla_tracks:
+        if _is_fx_preview_anim(track):
+            continue
+        if not track.strips:
+            continue
+        strip_act = track.strips[0].action
+        if _is_fx_preview_anim(strip_act):
+            continue
+        try:
+            curve_path = strip_act.get("mu_unity_curve_path") or path or ""
+            if curve_path is not None:
+                curve_path = str(curve_path)
+        except Exception:
+            curve_path = path or ""
+        key = _clip_dict_key(track.name, curve_path, strip_act)
+        if key not in animations:
+            animations[key] = []
+        animations[key].append((track, curve_path, "obj"))
+    return animations
+
+
+def collect_orphan_stub_animations(root, animations):
+    """Merge NLA from top-level mu_anim_stub empties sharing this import.
+
+    Path synthesis can leave stubs with ``parent=None`` when intermediate
+    MuObjects are bone-only (TriBitDrill shake). Those never appear under
+    ``collect_animations(root)``.
+    """
+    try:
+        iid = str(root.get("mu_import_id") or "")
+    except Exception:
+        iid = ""
+    if not iid:
+        return animations
+    for obj in bpy.data.objects:
+        try:
+            if not obj.get("mu_anim_stub"):
+                continue
+            if str(obj.get("mu_import_id") or "") != iid:
+                continue
+        except Exception:
+            continue
+        if obj.parent is not None:
+            # Already walked via collect_animations if under root
+            continue
+        if obj == root:
+            continue
+        extend_animations(animations, stub_object_animations(obj, ""))
+    return animations
+
 
 def find_path_root(animations):
     paths = {}
@@ -469,6 +542,16 @@ property_map = {
         ("m_Color.a", 1, 2),#probably not used
     ),
     "energy":(
+        ("m_Intensity", 1/light_power, 2),
+    ),
+    # Object-space light curves (import keeps Action on Object, not Light DB)
+    "data.color":(
+        ("m_Color.r", 1, 2),
+        ("m_Color.g", 1, 2),
+        ("m_Color.b", 1, 2),
+        ("m_Color.a", 1, 2),
+    ),
+    "data.energy":(
         ("m_Intensity", 1/light_power, 2),
     ),
     "rotation_euler":(
@@ -584,14 +667,26 @@ def make_curve(mu, muobj, curve, path, typ, action=None, anim_root=None):
                         stored = action[key]
                 except Exception:
                     stored = None
+                if not stored:
+                    # Blender may normalize data_path quoting; try stripped form
+                    try:
+                        raw_dp = dp.strip().strip('["]')
+                        key2 = "mu_uprop:%s:%d" % (raw_dp, curve.array_index)
+                        if key2 in action:
+                            stored = action[key2]
+                        key3 = 'mu_uprop:["%s"]:%d' % (raw_dp, curve.array_index)
+                        if not stored and key3 in action:
+                            stored = action[key3]
+                    except Exception:
+                        pass
             if not stored:
                 # Reconstruct Unity name from mu_audio_<name>
-                raw = dp.strip('["]')
+                raw = (dp or "").strip().strip('["]')
                 if raw.startswith("mu_audio_"):
                     stored = raw[len("mu_audio_"):]
                 else:
                     return None
-            property = stored
+            property = str(stored)
             mult = 1
             ctyp = 3
             mucurve.path = path
@@ -717,8 +812,12 @@ def make_curve(mu, muobj, curve, path, typ, action=None, anim_root=None):
     if (action is not None and typ in {"obj", "lit"} and not path):
         try:
             stored = action.get("mu_unity_curve_path")
-            if stored is not None and str(stored):
-                mucurve.path = normalize_mu_curve_path(str(stored))
+            if stored is not None and str(stored).strip():
+                # Orphan / authored Unity paths: exact string (no strip_nnn)
+                if action.get("mu_orphan_curve"):
+                    mucurve.path = str(stored).strip()
+                else:
+                    mucurve.path = normalize_mu_curve_path(str(stored))
         except Exception:
             pass
     return mucurve
@@ -876,10 +975,12 @@ def make_animations(mu, animations, anim_root):
         clip.lbCenter = (0, 0, 0)
         clip.lbSize = (0, 0, 0)
         clip.wrapMode = 1
-        # Single-pass: only Actions that actually contribute curves vote for
-        # wrapMode. Sibling empties sharing clip name "antenna" must not bleed.
+        # Prefer explicit mu_clip_wrap_mode from any Action on this clip
+        # (including those that did not add curves this pass). Majority only
+        # as fallback so partial exports cannot force Once over a real Ping-Pong.
         clip_action = None
         wrap_votes = []
+        wrap_votes_any = []  # all Actions, even without new curves
         seen_actions = set()
         contributed = False
 
@@ -923,8 +1024,43 @@ def make_animations(mu, animations, anim_root):
                 else:
                     path = norm
             if not muobj:
-                print(f"Object path not found: {path}")
-                continue
+                # Orphan / anim-stub Unity paths are not MuObjects in the
+                # exported tree (TriBitDrill shake, ladder garbage targets).
+                # Still emit curves on the Animation host with the stored path.
+                action_peek = track if isinstance(track, bpy.types.Action) else (
+                    track.strips[0].action if getattr(track, "strips", None) else None)
+                is_orphan_entry = False
+                stored_peek = ""
+                if action_peek is not None:
+                    try:
+                        stored_peek = str(
+                            action_peek.get("mu_unity_curve_path") or "").strip()
+                        is_orphan_entry = bool(
+                            action_peek.get("mu_orphan_curve")
+                            or action_peek.get("mu_anim_stub_owner")
+                        )
+                    except Exception:
+                        pass
+                if is_orphan_entry or stored_peek:
+                    host_mu = None
+                    if anim_root and anim_root in mu.object_paths:
+                        host_mu = mu.object_paths[anim_root]
+                    if host_mu is None and anim_root:
+                        leaf = anim_root.rstrip("/").split("/")[-1]
+                        hits = [p for p in mu.object_paths
+                                if p == anim_root or p.endswith("/" + leaf)]
+                        if len(hits) == 1:
+                            host_mu = mu.object_paths[hits[0]]
+                    if host_mu is not None:
+                        muobj = host_mu
+                        if stored_peek:
+                            path = stored_peek
+                    else:
+                        print(f"Object path not found: {path}")
+                        continue
+                else:
+                    print(f"Object path not found: {path}")
+                    continue
 
             # Strict host filter: entry must belong to THIS anim_root host.
             # Use orange-empty identity (mu_anim_bobj / mu_nla_owner / path),
@@ -986,12 +1122,38 @@ def make_animations(mu, animations, anim_root):
                 if ap in seen_actions:
                     continue
                 seen_actions.add(ap)
+                # Always record wrap from every Action on this clip (UI/test set it)
+                try:
+                    wrap_votes_any.append(read_mu_clip_wrap(action))
+                except Exception:
+                    pass
                 curve_rel = rel_path
-                # Material clips: prefer Unity path stored at import (shared mats)
                 if type(typ) == bpy.types.Material:
                     try:
-                        if "mu_unity_curve_path" in action:
-                            curve_rel = action["mu_unity_curve_path"]
+                        if action is not None and "mu_unity_curve_path" in action:
+                            stored = action["mu_unity_curve_path"]
+                            if stored is not None and str(stored).strip():
+                                curve_rel = str(stored).strip()
+                    except Exception:
+                        pass
+                elif typ in ("obj", "lit") and action is not None:
+                    try:
+                        stored = str(action.get("mu_unity_curve_path") or "").strip()
+                        is_orphan = bool(
+                            action.get("mu_orphan_curve")
+                            or action.get("mu_anim_stub_owner")
+                        )
+                        if stored and is_orphan:
+                            # Lossless: garbage / missing-GO paths from import
+                            curve_rel = stored
+                        elif stored:
+                            hier_leaf = (rel_path or "").rstrip("/").split("/")[-1]
+                            store_leaf = stored.rstrip("/").split("/")[-1]
+                            # Unity duplicate-name disambiguator (.001)
+                            if (store_leaf and hier_leaf
+                                    and store_leaf != hier_leaf
+                                    and strip_nnn(store_leaf) == hier_leaf):
+                                curve_rel = stored  # keep .001 — do NOT normalize
                     except Exception:
                         pass
                 n_before = len(clip.curves)
@@ -1009,16 +1171,34 @@ def make_animations(mu, animations, anim_root):
                         clip.curves.append(curve_data)
                 if hasattr(muobj, "animated_bones"):
                     transform_curves(muobj)
-                # Only actions that actually added curves may vote for wrapMode
+                # Actions that added curves still preferred for selected clip name
                 if len(clip.curves) > n_before:
                     contributed = True
                     if clip_action is None:
                         clip_action = action
                     wrap_votes.append(read_mu_clip_wrap(action))
 
-        if wrap_votes:
-            from collections import Counter
-            clip.wrapMode = int(Counter(wrap_votes).most_common(1)[0][0])
+        # Prefer unanimous / majority from ALL actions on the clip first, then
+        # from contributors only. Avoid silent Once when UI set Ping-Pong
+        # (light-only Actions often add 0 curves after host filter and used
+        # to force Once via an empty wrap_votes list).
+        from collections import Counter
+        chosen = None
+        for pool in (wrap_votes_any, wrap_votes):
+            if not pool:
+                continue
+            counts = Counter(int(m) for m in pool)
+            mode, _n = counts.most_common(1)[0]
+            non_once = [int(m) for m in pool if int(m) != 1]
+            # Unique non-Once mode wins even when Once is the plurality
+            # (Once is the code default — treat it as weaker signal).
+            if non_once and len(set(non_once)) == 1:
+                chosen = non_once[0]
+            else:
+                chosen = int(mode)
+            break
+        if chosen is not None:
+            clip.wrapMode = int(chosen)
         if clip_action is not None and selected_clip_name is None:
             try:
                 value = clip_action.get("mu_animation_clip", "")
@@ -1026,8 +1206,10 @@ def make_animations(mu, animations, anim_root):
                     selected_clip_name = str(value)
             except Exception:
                 pass
-        # Skip empty clips (all entries filtered out as other hosts)
-        if not contributed and not clip.curves:
+        # Skip empty clips (all entries filtered out as other hosts).
+        # Keep metadata-only clips (wrap/autoPlay tags, zero curves) so
+        # Combined / LR87 / Viking Propulsion round-trip clip names.
+        if not contributed and not clip.curves and not wrap_votes_any:
             continue
         anim.clips.append(clip)
 
