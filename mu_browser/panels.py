@@ -2696,15 +2696,8 @@ class VIEW3D_PT_mu_part_browser(bpy.types.Panel):
                 from ..import_mu.progress_util import draw_mu_panel_progress as _dpp
             except Exception:
                 box = layout.box()
-                if job_tot > 0:
-                    pct = int(100 * job_cur / max(1, job_tot))
-                    box.label(
-                        text="%s  %d/%d (%d%%)" % (
-                            job_title or "Working…", job_cur, job_tot, pct),
-                        icon="TIME",
-                    )
-                else:
-                    box.label(text=job_title or "Loading…", icon="TIME")
+                # job_title already carries "Name N/M (P.P%)" for thumb jobs
+                box.label(text=job_title or "Loading…", icon="TIME")
             _ensure_parts_populated(context, br)
         else:
             row = layout.row(align=True)

@@ -999,18 +999,22 @@ def _show_fx_for_thumbnail(root):
     return shown
 
 
-def _should_exclude_from_thumbnail(name: str, *, keep_shroud: bool = False) -> bool:
+def _should_exclude_from_thumbnail(
+    name: str, *, keep_shroud: bool = False, keep_fairing: bool = False
+) -> bool:
     """Objects excluded from thumbnails and from camera framing.
 
-    colliders, nodes, fairings, shrouds (unless part is a shroud),
-    higher LODs, .broken meshes, cfg/fx previews.
+    colliders, nodes, fairings (unless the part *is* a fairing), shrouds
+    (unless the part is a shroud), higher LODs, .broken meshes, cfg/fx previews.
     """
     n = (name or "").lower()
     if not n:
         return False
     if n.startswith("node_") or n.startswith("node.") or ".node" in n:
         return True
-    if "fairing" in n:
+    # Fairing *parts* must keep their fairing meshes; only exclude fairing
+    # sub-objects on non-fairing parts (e.g. engine fairing base helpers).
+    if "fairing" in n and not keep_fairing:
         return True
     if "shroud" in n and not keep_shroud:
         return True
@@ -1021,9 +1025,20 @@ def _should_exclude_from_thumbnail(name: str, *, keep_shroud: bool = False) -> b
             return True
     if "cfg_preview" in n or "fx_preview" in n:
         return True
-    if ".collider" in n or n.startswith("col_") or "collision" in n:
-        return True
-    if "collider" in n:
+    # Collider patterns — keep precise (do NOT use bare startswith "col",
+    # that false-positives colony/collector/color/etc.).
+    if (
+        ".collider" in n
+        or n.startswith("col_")
+        or n.startswith("col1")
+        or n.startswith("col2")
+        or n.startswith("col3")
+        or n.startswith("col4")
+        or n.startswith("col5")
+        or n.startswith("col6")
+        or "collision" in n
+        or "collider" in n
+    ):
         return True
     try:
         from ..utils.utils import is_hideable_collider_name
@@ -1034,7 +1049,7 @@ def _should_exclude_from_thumbnail(name: str, *, keep_shroud: bool = False) -> b
     return False
 
 
-def _hide_for_thumbnail(root, keep_shroud=False):
+def _hide_for_thumbnail(root, keep_shroud=False, keep_fairing=False):
     stack = [root] + list(getattr(root, "children_recursive", []) or [])
     for obj in stack:
         if _is_fx_preview_obj(obj):
@@ -1043,7 +1058,9 @@ def _hide_for_thumbnail(root, keep_shroud=False):
             name = obj.name or ""
         except Exception:
             continue
-        if not _should_exclude_from_thumbnail(name, keep_shroud=keep_shroud):
+        if not _should_exclude_from_thumbnail(
+            name, keep_shroud=keep_shroud, keep_fairing=keep_fairing
+        ):
             continue
         try:
             obj.hide_set(True)
@@ -1056,8 +1073,10 @@ def _hide_for_thumbnail(root, keep_shroud=False):
 
 
 def _collect_frame_points(objs, *, keep_shroud: bool = False,
+                          keep_fairing: bool = False,
                           include_evaluated: bool = True,
-                          include_raw: bool = True):
+                          include_raw: bool = True,
+                          include_helpers: bool = False):
     """Collect conservative world-space bounds for rendered MU geometry.
 
     IMPORTANT: evaluated and raw bounds are collected independently. The old
@@ -1065,6 +1084,11 @@ def _collect_frame_points(objs, *, keep_shroud: bool = False,
     which meant a pathological/deferred evaluated bound could completely hide
     a perfectly valid raw mesh bound. For thumbnail framing we prefer the
     union of both representations.
+
+    include_helpers=True is a last-resort path used when normal (visible)
+    collection returns empty: it ignores collider/helper exclusion and hide
+    flags so pure-collider, FreeIVA shell, transform-only or empty-mesh
+    assets still produce a framed thumbnail instead of hard-failing.
     """
     from mathutils import Vector
 
@@ -1076,23 +1100,38 @@ def _collect_frame_points(objs, *, keep_shroud: bool = False,
 
     for o in objs:
         try:
-            if getattr(o, "type", "") != "MESH":
-                continue
+            otype = getattr(o, "type", "") or ""
             oname = o.name or ""
         except Exception:
             continue
-        if _should_exclude_from_thumbnail(oname, keep_shroud=keep_shroud):
+
+        # Last-resort: also use EMPTY / ARMATURE origins so transform-only
+        # hierarchies still yield a non-empty point set (then may still fall
+        # through to the labeled placeholder if bounds are degenerate).
+        if include_helpers and otype in ("EMPTY", "ARMATURE"):
+            try:
+                points.append(o.matrix_world.translation.copy())
+            except Exception:
+                pass
             continue
-        try:
-            if bool(getattr(o, "hide_render", False)):
+
+        if otype != "MESH":
+            continue
+        if not include_helpers:
+            if _should_exclude_from_thumbnail(
+                oname, keep_shroud=keep_shroud, keep_fairing=keep_fairing
+            ):
                 continue
-        except Exception:
-            pass
-        try:
-            if bool(o.hide_get()):
-                continue
-        except Exception:
-            pass
+            try:
+                if bool(getattr(o, "hide_render", False)):
+                    continue
+            except Exception:
+                pass
+            try:
+                if bool(o.hide_get()):
+                    continue
+            except Exception:
+                pass
 
         if include_evaluated and depsgraph is not None:
             try:
@@ -1156,17 +1195,12 @@ def _frame_stats(points):
 
 
 def _load_render_metrics(path: str):
-    """Validate the rendered PNG/container only; never classify pixels as cropped/tiny.
+    """Validate rendered PNG dimensions and detect fully black / fully transparent frames.
 
-    Pixel-difference validation was fundamentally unreliable here: KSP materials,
-    world lighting, transparent film, and Eevee shading can legitimately make the
-    four corners different from the world background. That made correctly framed
-    models look "cropped" and caused every generated thumbnail to be discarded.
-
-    Framing is already guaranteed by _fit_ortho_camera() from the actual mesh bounds.
-    Therefore this validator deliberately checks only that Blender produced a real
-    image of the requested dimensions. Crop/tiny detection belongs to the geometric
-    fit stage, not to post-render color analysis.
+    Crop/tiny geometric detection stays in the framing stage. Here we only reject
+    pathological outputs that are 100% transparent (empty render / out-of-frame /
+    camera too far) or 100% black (lighting/crash/zero emission). Those cases
+    trigger a repair retry upstream.
     """
     img = None
     try:
@@ -1179,11 +1213,67 @@ def _load_render_metrics(path: str):
                 "size": (w, h),
                 "expected": (int(_ICON_SIZE), int(_ICON_SIZE)),
             }
-        return {
-            "valid": True,
-            "reason": "ok",
-            "size": (w, h),
-        }
+
+        # Fast content probe: count non-transparent and non-black pixels.
+        # Fully empty (alpha~0) or fully black (RGB~0 with any alpha) frames
+        # are treated as invalid so the caller can attempt a repair.
+        try:
+            px = list(img.pixels)  # flat RGBA float sequence
+            n = len(px) // 4
+            if n <= 0:
+                return {
+                    "valid": False,
+                    "reason": "empty_pixels",
+                    "size": (w, h),
+                }
+            alpha_thr = float(THUMB_ALPHA_THRESHOLD)
+            black_thr = 0.02
+            opaque = 0
+            non_black = 0
+            # Sample every 4th pixel for speed on large icons; full scan for 128.
+            step = 1 if n <= 128 * 128 else 4
+            for i in range(0, n, step):
+                base = i * 4
+                a = px[base + 3]
+                if a > alpha_thr:
+                    opaque += 1
+                    r, g, b = px[base], px[base + 1], px[base + 2]
+                    if r > black_thr or g > black_thr or b > black_thr:
+                        non_black += 1
+            # Scale counts when we subsampled.
+            if step > 1:
+                opaque *= step
+                non_black *= step
+            if opaque < int(THUMB_MIN_CONTENT_PIXELS):
+                return {
+                    "valid": False,
+                    "reason": "fully_transparent",
+                    "size": (w, h),
+                    "opaque_pixels": opaque,
+                    "non_black_pixels": non_black,
+                }
+            if non_black < int(THUMB_MIN_CONTENT_PIXELS):
+                return {
+                    "valid": False,
+                    "reason": "fully_black",
+                    "size": (w, h),
+                    "opaque_pixels": opaque,
+                    "non_black_pixels": non_black,
+                }
+            return {
+                "valid": True,
+                "reason": "ok",
+                "size": (w, h),
+                "opaque_pixels": opaque,
+                "non_black_pixels": non_black,
+            }
+        except Exception as e:
+            # If pixel inspect fails, still accept on dimensions alone.
+            return {
+                "valid": True,
+                "reason": "ok_dim_only:%s" % e,
+                "size": (w, h),
+            }
     except Exception as e:
         return {"valid": False, "reason": "image_inspect_error:%s" % e}
     finally:
@@ -1885,8 +1975,29 @@ def probe_eevee_gpu():
         pass
 
 
-def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False, show_attach_points: bool = False) -> Optional[str]:
+def generate_thumbnail(
+    mu_path: str,
+    part_name: str = "",
+    *,
+    force: bool = False,
+    show_attach_points: bool = False,
+    progress_cb=None,
+) -> Optional[str]:
+    """Generate one thumbnail. Optional *progress_cb(frac, msg)* with frac in [0, 1).
+
+    Stages (a few writes only — no measurable cost vs. import/render):
+      0.05 prepare, 0.15 import, 0.40 objects, 0.55 frame, 0.70 render, 0.90 commit
+    """
+    def _p(frac, msg=""):
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(float(frac), msg)
+        except Exception:
+            pass
+
     _dev_info("generate", os.path.basename(mu_path), part_name or "?")
+    _p(0.05, "prepare")
 
     if (
         not mu_path
@@ -1930,6 +2041,7 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
         "[mu_thumb] cache write:",
         os.path.basename(out),
     )
+    _p(0.15, "import")
 
     from ..import_mu import import_mu
     from mathutils import Vector
@@ -2139,6 +2251,7 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
                     root,
                 )
             )
+            _p(0.40, "objects")
 
         except Exception as e:
 
@@ -2235,11 +2348,17 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
             except Exception:
                 pass
             _dev_info("FX mode")
+            keep_shroud = False
+            keep_fairing = False
         else:
             _dev_info("normal mode")
             keep_shroud = False
+            keep_fairing = False
             try:
-                keep_shroud = "shroud" in (part_name or "").lower()
+                pn = (part_name or "").lower()
+                keep_shroud = "shroud" in pn
+                # Part *is* a fairing / fairing-base → keep fairing meshes visible
+                keep_fairing = "fairing" in pn
             except Exception:
                 pass
 
@@ -2265,6 +2384,7 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
             ) or []
         )
 
+        _p(0.50, "frame")
         print(
             "[mu_thumb] objects under root:",
             len(objs),
@@ -2348,7 +2468,9 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
             # could define a gigantic AABB while the actual render contained only
             # a tiny visible mesh (the exact symptom seen with restock-wheel-1-T).
             try:
-                _hide_for_thumbnail(root, keep_shroud=keep_shroud)
+                _hide_for_thumbnail(
+                    root, keep_shroud=keep_shroud, keep_fairing=keep_fairing
+                )
             except Exception as e:
                 print("[mu_thumb] hide_for_thumbnail before fit:", e)
             try:
@@ -2356,16 +2478,90 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
             except Exception:
                 pass
 
-            use_coords = _collect_frame_points(objs, keep_shroud=keep_shroud)
+            use_coords = _collect_frame_points(
+                objs, keep_shroud=keep_shroud, keep_fairing=keep_fairing
+            )
 
             if not use_coords:
-                print("[mu_thumb] FAIL: no visible frame points")
-                return None
+                # Last-resort: include helpers/colliders (and ignore hide flags)
+                # so pure-collider, FreeIVA shell, transform-only or empty-mesh
+                # assets still get a framed thumbnail instead of hard-failing.
+                use_coords = _collect_frame_points(
+                    objs, keep_shroud=keep_shroud, keep_fairing=keep_fairing,
+                    include_evaluated=True, include_raw=True,
+                    include_helpers=True,
+                )
+                if use_coords:
+                    print(
+                        "[mu_thumb][DEV] no visible frame points -> "
+                        "last-resort framing with helpers/colliders, pts=",
+                        len(use_coords),
+                        flush=True,
+                    )
+                    # Unhide helpers so the render actually contains geometry.
+                    for o in objs:
+                        try:
+                            if getattr(o, "type", "") != "MESH":
+                                continue
+                            o.hide_set(False)
+                            o.hide_render = False
+                        except Exception:
+                            pass
+                    try:
+                        bpy.context.view_layer.update()
+                    except Exception:
+                        pass
+                else:
+                    # Nothing renderable (pure collider / depth mask / empty root /
+                    # transform-only). Write a transparent labeled placeholder so
+                    # the grid is never blank and the user sees *why*.
+                    label = _classify_empty_geometry(objs, root)
+                    # Detailed dump so "NO MESH" on parts that look like they
+                    # have geometry is debuggable (nested IVA, excluded fairing,
+                    # 0-vert mesh, etc.).
+                    try:
+                        dump = []
+                        for o in (objs or [])[:12]:
+                            try:
+                                t = getattr(o, "type", "?")
+                                n = o.name or "?"
+                                nv = 0
+                                if t == "MESH" and getattr(o, "data", None) is not None:
+                                    nv = len(o.data.vertices)
+                                dump.append("%s:%s:v%d" % (t, n, nv))
+                            except Exception:
+                                pass
+                        print(
+                            "[mu_thumb][DEV] no visible frame points -> "
+                            "empty-geometry placeholder label=%s objs=%s"
+                            % (label, dump),
+                            flush=True,
+                        )
+                    except Exception:
+                        print(
+                            "[mu_thumb][DEV] no visible frame points -> "
+                            "empty-geometry placeholder label=%s"
+                            % label,
+                            flush=True,
+                        )
+                    if _write_empty_geometry_placeholder(out, label):
+                        return out
+                    print("[mu_thumb] FAIL: no visible frame points")
+                    return None
 
             ok = _fit_ortho_camera(
                 cam_obj, cam_data, use_coords, margin=float(THUMB_FRAME_MARGIN)
             )
             if not ok:
+                label = _classify_empty_geometry(objs, root)
+                print(
+                    "[mu_thumb][DEV] camera fit failed -> "
+                    "empty-geometry placeholder label=%s"
+                    % label,
+                    flush=True,
+                )
+                if _write_empty_geometry_placeholder(out, label):
+                    return out
                 print("[mu_thumb] FAIL: camera fit")
                 return None
 
@@ -2555,21 +2751,53 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
             fit_sets = [
                 (use_coords, float(THUMB_FRAME_MARGIN), "combined"),
                 (_collect_frame_points(objs, keep_shroud=keep_shroud,
+                                       keep_fairing=keep_fairing,
                                        include_evaluated=False, include_raw=True),
                  float(THUMB_RETRY_MARGIN), "raw-only"),
+                # Repair path for fully black / fully transparent results:
+                # include helpers/colliders and use a generous margin
+                # (camera too far / out-of-frame / empty FreeIVA shell cases).
+                (_collect_frame_points(objs, keep_shroud=keep_shroud,
+                                       keep_fairing=keep_fairing,
+                                       include_evaluated=True, include_raw=True,
+                                       include_helpers=True),
+                 max(float(THUMB_RETRY_MARGIN), 2.2), "helpers+wide"),
             ]
-            for attempt, (fit_points, margin, label) in enumerate(fit_sets[:THUMB_MAX_RETRIES + 1]):
+            for attempt, (fit_points, margin, label) in enumerate(fit_sets):
                 if not fit_points:
                     continue
                 _dev_info("fit", attempt + 1, label)
                 if not _fit_ortho_camera(cam_obj, cam_data, fit_points, margin=margin):
                     continue
+                # For the helpers repair path, make sure geometry is actually visible.
+                if label == "helpers+wide":
+                    for o in objs:
+                        try:
+                            if getattr(o, "type", "") != "MESH":
+                                continue
+                            o.hide_set(False)
+                            o.hide_render = False
+                        except Exception:
+                            pass
+                    try:
+                        bpy.context.view_layer.update()
+                    except Exception:
+                        pass
                 chosen_points = fit_points
                 if DEV_OVERLAY:
                     _overlay_for_points(scene, chosen_points, cam_obj, cam_data)
+                _p(0.70, "render")
                 valid, metrics = _render_to_path(scene, tmp_out)
                 if valid:
                     break
+                reason = (metrics or {}).get("reason", "")
+                if reason in ("fully_transparent", "fully_black"):
+                    print(
+                        "[mu_thumb][DEV] empty/black/transparent detect -> "
+                        "attempt repair (%s) reason=%s metrics=%s"
+                        % (label, reason, metrics),
+                        flush=True,
+                    )
                 try:
                     os.remove(tmp_out)
                 except OSError:
@@ -2585,6 +2813,14 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
                     _overlay_for_points(scene, chosen_points, cam_obj, cam_data)
                 valid, metrics = _render_to_path(scene, tmp_out)
             if not valid:
+                reason = (metrics or {}).get("reason", "")
+                if reason in ("fully_transparent", "fully_black"):
+                    print(
+                        "[mu_thumb][DEV] FX empty/black/transparent detect -> "
+                        "scale repair reason=%s metrics=%s"
+                        % (reason, metrics),
+                        flush=True,
+                    )
                 try:
                     cam_data.ortho_scale *= 1.75
                 except Exception:
@@ -2597,6 +2833,22 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
             probe_eevee_gpu()
 
         if not valid:
+            reason = (metrics or {}).get("reason", "")
+            if reason in ("fully_transparent", "fully_black", "empty_pixels"):
+                label = _classify_empty_geometry(objs, root)
+                print(
+                    "[mu_thumb][DEV] render empty/black after retries -> "
+                    "empty-geometry placeholder label=%s metrics=%s"
+                    % (label, metrics),
+                    flush=True,
+                )
+                try:
+                    if os.path.isfile(tmp_out):
+                        os.remove(tmp_out)
+                except OSError:
+                    pass
+                if _write_empty_geometry_placeholder(out, label):
+                    return out
             print("[mu_thumb] FAIL: rendered PNG validation failed:", metrics)
             try:
                 if os.path.isfile(tmp_out):
@@ -2605,6 +2857,7 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
                 pass
             return None
 
+        _p(0.90, "commit")
         if not _commit_render(tmp_out, out):
             try:
                 if os.path.isfile(tmp_out):
@@ -2686,6 +2939,242 @@ def generate_thumbnail(mu_path: str, part_name: str = "", *, force: bool = False
                 )
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Empty-geometry classification + labeled transparent placeholders
+# ---------------------------------------------------------------------------
+# When a .mu has no renderable mesh (pure collider, depth mask, empty root,
+# transform-only, etc.) we still write a valid cache PNG: transparent background
+# with a short white label (1px black outline) so the browser grid is never blank
+# and the user sees *why* there is no model preview.
+
+_LABEL_FONT_5X7 = {
+    # 5 columns x 7 rows, MSB = left. Space is empty.
+    " ": [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    "A": [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+    "B": [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
+    "C": [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
+    "D": [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
+    "E": [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+    "F": [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+    "G": [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E],
+    "H": [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+    "I": [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+    "K": [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+    "L": [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+    "M": [0x11, 0x1B, 0x15, 0x11, 0x11, 0x11, 0x11],
+    "N": [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+    "O": [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+    "P": [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+    "R": [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+    "S": [0x0E, 0x11, 0x10, 0x0E, 0x01, 0x11, 0x0E],
+    "T": [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+    "U": [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+    "Y": [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
+    "-": [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
+    "/": [0x01, 0x02, 0x04, 0x04, 0x08, 0x10, 0x10],
+    ".": [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
+}
+
+
+def _classify_empty_geometry(objs, root) -> str:
+    """Return a short label explaining why there is no visible mesh to render."""
+    names = []
+    mesh_names = []
+    mesh_with_verts = 0
+    empties = 0
+    for o in objs or []:
+        try:
+            n = (o.name or "").lower()
+            names.append(n)
+            t = getattr(o, "type", "") or ""
+            if t == "MESH":
+                mesh_names.append(n)
+                me = getattr(o, "data", None)
+                if me is not None and len(getattr(me, "vertices", []) or []) > 0:
+                    mesh_with_verts += 1
+            elif t in ("EMPTY", "ARMATURE"):
+                empties += 1
+        except Exception:
+            continue
+
+    def _is_collider(n: str) -> bool:
+        return (
+            "collider" in n
+            or n.startswith("col_")
+            or ".collider" in n
+            or "collision" in n
+            or n.startswith("col1")
+            or n.startswith("col2")
+            or n.startswith("col3")
+            or n.startswith("col4")
+            or n.startswith("col5")
+            or n.startswith("col6")
+        )
+
+    def _is_mask(n: str) -> bool:
+        return (
+            "depthmask" in n
+            or "depth_mask" in n
+            or "overlaymask" in n
+            or "overlay_mask" in n
+            or n.endswith("mask")
+            or "mask" in n and ("window" in n or "cabin" in n or "inline" in n or "hitch" in n)
+        )
+
+    if mesh_names and all(_is_collider(n) for n in mesh_names) and mesh_with_verts == 0:
+        return "ONLY COLLIDER"
+    if mesh_names and all(_is_collider(n) for n in mesh_names):
+        return "ONLY COLLIDER"
+    if names and all(_is_collider(n) or not n for n in names if n):
+        # all named objects look like colliders (even if type != MESH)
+        non_empty = [n for n in names if n]
+        if non_empty and all(_is_collider(n) for n in non_empty):
+            return "ONLY COLLIDER"
+    if mesh_names and all(_is_mask(n) for n in mesh_names):
+        return "ONLY DEPTH MASK"
+    if names and any(_is_mask(n) for n in names) and mesh_with_verts == 0:
+        if all(_is_mask(n) or _is_collider(n) or not n for n in names):
+            return "ONLY DEPTH MASK"
+    if mesh_with_verts == 0 and not mesh_names and empties > 0:
+        return "ONLY ROOT"
+    if mesh_with_verts == 0 and mesh_names:
+        return "EMPTY MESH"
+    if mesh_with_verts == 0:
+        return "NO MESH"
+    return "NO MESH"
+
+
+def _draw_label_pixels(size: int, lines) -> list:
+    """Build flat RGBA float pixels: transparent bg, white glyphs with 1px black outline.
+
+    Two-pass draw is required: first all outline pixels, then all fill pixels.
+    A single-pass "outline then fill per pixel" lets a neighbour's outline
+    overwrite the previous pixel's white fill, leaving the whole glyph black.
+    """
+    # scale so multi-line labels fit inside the icon with padding
+    scale = 2
+    glyph_w, glyph_h = 5 * scale, 7 * scale
+    gap = 1 * scale
+    line_gap = 3 * scale
+    # measure
+    max_cols = max((len(ln) for ln in lines), default=1)
+    text_w = max_cols * (glyph_w + gap) - gap
+    text_h = len(lines) * glyph_h + max(0, len(lines) - 1) * line_gap
+    # shrink scale if needed
+    while scale > 1 and (text_w + 8 > size or text_h + 8 > size):
+        scale -= 1
+        glyph_w, glyph_h = 5 * scale, 7 * scale
+        gap = 1 * scale
+        line_gap = 3 * scale
+        text_w = max_cols * (glyph_w + gap) - gap
+        text_h = len(lines) * glyph_h + max(0, len(lines) - 1) * line_gap
+
+    ox = max(0, (size - text_w) // 2)
+    oy = max(0, (size - text_h) // 2)
+
+    # Collect every filled pixel first (Blender image y=0 is bottom).
+    fills = set()
+    for li, line in enumerate(lines):
+        ly = oy + li * (glyph_h + line_gap)
+        for ci, ch in enumerate(line.upper()):
+            bits = _LABEL_FONT_5X7.get(ch, _LABEL_FONT_5X7[" "])
+            lx = ox + ci * (glyph_w + gap)
+            for row in range(7):
+                row_bits = bits[row]
+                for col in range(5):
+                    if row_bits & (1 << (4 - col)):
+                        for sy in range(scale):
+                            for sx in range(scale):
+                                py = size - 1 - (ly + row * scale + sy)
+                                px = lx + col * scale + sx
+                                if 0 <= px < size and 0 <= py < size:
+                                    fills.add((px, py))
+
+    # Expand fills by 1px for the black outline (8-neighbourhood).
+    outlines = set()
+    for px, py in fills:
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                oxp, oyp = px + dx, py + dy
+                if 0 <= oxp < size and 0 <= oyp < size and (oxp, oyp) not in fills:
+                    outlines.add((oxp, oyp))
+
+    # Flat RGBA buffer, transparent background.
+    pixels = [0.0] * (size * size * 4)
+    black = (0.0, 0.0, 0.0, 1.0)
+    white = (1.0, 1.0, 1.0, 1.0)
+
+    def put(x, y, rgba):
+        i = (y * size + x) * 4
+        pixels[i] = rgba[0]
+        pixels[i + 1] = rgba[1]
+        pixels[i + 2] = rgba[2]
+        pixels[i + 3] = rgba[3]
+
+    # Pass 1: black outline
+    for px, py in outlines:
+        put(px, py, black)
+    # Pass 2: white fill (always on top — never overwritten)
+    for px, py in fills:
+        put(px, py, white)
+
+    return pixels
+
+
+def _write_empty_geometry_placeholder(out_path: str, label: str) -> bool:
+    """Write a transparent PNG with a white outlined label. Returns True on success."""
+    try:
+        # Split long labels into up to 3 lines for readability
+        words = (label or "NO MESH").upper().split()
+        if len(words) <= 2:
+            lines = [" ".join(words)]
+        else:
+            # prefer 2 lines
+            mid = (len(words) + 1) // 2
+            lines = [" ".join(words[:mid]), " ".join(words[mid:])]
+        size = int(_ICON_SIZE)
+        pixels = _draw_label_pixels(size, lines)
+        img = bpy.data.images.new(
+            "_mu_empty_geom_thumb",
+            width=size,
+            height=size,
+            alpha=True,
+        )
+        try:
+            # Keep written RGB values as-is (no linear/sRGB round-trip that
+            # can crush near-white or make outlines look wrong in the browser).
+            img.colorspace_settings.name = "Non-Color"
+        except Exception:
+            pass
+        img.pixels = pixels
+        # Force Blender to commit the buffer before save.
+        try:
+            img.update()
+        except Exception:
+            pass
+        img.filepath_raw = out_path
+        img.file_format = "PNG"
+        try:
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        img.save()
+        bpy.data.images.remove(img)
+        print(
+            "[mu_thumb][DEV] empty-geometry placeholder written:",
+            os.path.basename(out_path),
+            "label=",
+            label,
+            flush=True,
+        )
+        return os.path.isfile(out_path) and os.path.getsize(out_path) > 32
+    except Exception as e:
+        print("[mu_thumb][DEV] placeholder write failed:", type(e).__name__, e, flush=True)
+        return False
 
 
 def _default_thumb_path() -> str:

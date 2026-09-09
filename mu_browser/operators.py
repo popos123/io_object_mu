@@ -17,8 +17,8 @@ from bpy.props import StringProperty, BoolProperty, IntProperty
 # ---------------------------------------------------------------------------
 # Tunables (edit here)
 # ---------------------------------------------------------------------------
-JOB_POLL_INTERVAL = 0.25   # seconds between progress-bar / worker polls
-THUMB_MAX_WORKERS = 10     # background Blender processes for Thumbs/Regen
+JOB_POLL_INTERVAL = 0.25   # seconds between progress-bar / worker polls (file I/O)
+THUMB_MAX_WORKERS = 6      # background Blender processes for Thumbs/Regen
 THUMB_WORKER_BELOW_NORMAL = True  # reduce UI contention while workers start/render
 
 
@@ -29,7 +29,7 @@ THUMB_WORKER_BELOW_NORMAL = True  # reduce UI contention while workers start/ren
 _job = {
     "kind": None,           # None | "catalog" | "thumbs" | "regen"
     "title": "",            # short title for blue bar (no counts)
-    "current": 0,
+    "current": 0,           # real progress from workers (may be fractional)
     "total": 0,
     "cancel": False,
     "started": 0.0,
@@ -62,7 +62,10 @@ def job_is_active(kind=None) -> bool:
 
 
 def job_progress():
-    """Return (kind, title, current, total) for UI."""
+    """Return (kind, title, current, total) for UI.
+
+    *current* may be fractional for thumb jobs (e.g. 3.4 = item 3 at 40%).
+    """
     from . import catalog
     k = _job.get("kind")
     if k == "catalog" or (not k and catalog.catalog_scan_running()):
@@ -76,7 +79,11 @@ def job_progress():
             )
     if not k:
         return (None, "", 0, 0)
-    return (k, _job.get("title") or k, int(_job.get("current") or 0), int(_job.get("total") or 0))
+    try:
+        cur = float(_job.get("current") or 0)
+    except Exception:
+        cur = 0.0
+    return (k, _job.get("title") or k, cur, int(_job.get("total") or 0))
 
 
 def _tag_mu_areas(force=False):
@@ -122,46 +129,84 @@ def _progress_begin(context, total, title):
         return None, None
 
 
+def _format_thumb_progress_title(base, cur_f, tot):
+    """File counter only: integer N/M (which .mu / how many).
+
+    Do NOT embed a percent here — progress_util appends
+    " — Working… (P%)" itself. Embedding % caused a double display:
+      "Generate Thumbnails 25/162 (15.6%) — Working… (15%)"
+    Desired:
+      "Generate Thumbnails 25/162 — Working… (15.6%)"
+    The decimal percent is driven by float current/total on the handle.
+    """
+    tot = max(1, int(tot or 1))
+    try:
+        cur_f = float(cur_f)
+    except Exception:
+        cur_f = 0.0
+    if cur_f < 0:
+        cur_f = 0.0
+    if cur_f > tot:
+        cur_f = float(tot)
+    n_done = int(cur_f) if cur_f < tot else tot
+    if n_done < 0:
+        n_done = 0
+    base = (base or "").strip() or "Generate Thumbnails"
+    return "%s %d/%d" % (base, n_done, tot)
+
+
 def _progress_update(handle, current, total, title=""):
-    """Update blue bar: current/total numbers + title (may already contain N/M)."""
+    """Update blue bar. *current* may be float (sub-item stages) for accurate %."""
     if handle is None:
         return
-    cur = int(current)
+    try:
+        cur_f = float(current)
+    except Exception:
+        cur_f = 0.0
+    cur_i = int(cur_f)  # floor — integer file counter when API needs int
     tot = max(1, int(total or 1))
-    # Build a title that always exposes ile/na ile for progress_util text
     t = (title or "").strip()
-    if t and "/" not in t:
-        t = "%s %d/%d" % (t, cur, tot)
-    elif not t:
-        t = "%d/%d" % (cur, tot)
+    if not t:
+        t = _format_thumb_progress_title("Generate Thumbnails", cur_f, tot)
 
-    for name in ("update", "step", "set", "set_progress", "tick", "set_text"):
-        fn = getattr(handle, name, None)
-        if not callable(fn):
-            continue
-        ok = False
-        for args in (
-            (cur, tot, t),
-            (cur, tot),
-            (cur,),
-            (t,),
-            (cur, t),
+    # MuProgressSession.update(value=..., text=..., force=...) — prefer kwargs.
+    ok = False
+    fn = getattr(handle, "update", None)
+    if callable(fn):
+        for kwargs in (
+            {"value": cur_f, "text": "Working…", "force": True},
+            {"value": cur_f, "text": "Working…"},
+            {"value": cur_f},
         ):
             try:
-                fn(*args)
+                fn(**kwargs)
                 ok = True
                 break
             except TypeError:
                 continue
             except Exception:
                 break
-        if ok:
-            break
+    if not ok:
+        for name in ("step", "set", "set_progress", "tick", "set_text"):
+            fn = getattr(handle, name, None)
+            if not callable(fn):
+                continue
+            for args in ((cur_f, tot, t), (cur_i, tot, t), (cur_i,), (t,)):
+                try:
+                    fn(*args)
+                    ok = True
+                    break
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+            if ok:
+                break
 
     for attr, val in (
-        ("current", cur),
-        ("progress", cur),
-        ("value", cur),
+        ("current", cur_f),
+        ("progress", cur_f),
+        ("value", cur_f),
         ("total", tot),
         ("max", tot),
         ("maximum", tot),
@@ -170,7 +215,14 @@ def _progress_update(handle, current, total, title=""):
             try:
                 setattr(handle, attr, val)
             except Exception:
-                pass
+                try:
+                    setattr(
+                        handle,
+                        attr,
+                        cur_i if attr in ("current", "progress", "value") else val,
+                    )
+                except Exception:
+                    pass
     for attr in ("title", "text", "label", "message", "status"):
         if t and hasattr(handle, attr):
             try:
@@ -201,7 +253,7 @@ def _job_start(kind, title, total, context=None):
     _job["kind"] = kind
     _job["title"] = title
     _job["base_title"] = title
-    _job["current"] = 0
+    _job["current"] = 0.0
     _job["total"] = max(1, int(total))
     _job["cancel"] = False
     _job["started"] = time.time()
@@ -219,8 +271,15 @@ def _job_start(kind, title, total, context=None):
 
 
 def _job_update(current, total=None, title=None, force_ui=False):
-    """Update progress. *title* is the clean base only (no counts); omit to keep base."""
-    cur = int(current)
+    """Update progress. *title* is the clean base only (no counts); omit to keep base.
+
+    *current* may be fractional (thumb sub-stages). Display title is only
+    "Base N/M" (integers). progress_util appends " — Working… (P%)".
+    """
+    try:
+        cur = float(current)
+    except Exception:
+        cur = 0.0
     if total is not None:
         _job["total"] = max(1, int(total))
     if title is not None:
@@ -228,20 +287,26 @@ def _job_update(current, total=None, title=None, force_ui=False):
         _job["base_title"] = clean
     _job["current"] = cur
     tot = int(_job.get("total") or 1)
-    base = (_job.get("base_title") or "").strip() or "Working"
-    display = "%s %d/%d" % (base, cur, tot) if tot > 0 else base
+    base = (_job.get("base_title") or "").strip() or "Generate Thumbnails"
+    display = _format_thumb_progress_title(base, cur, tot)
     _job["title"] = display
-    # Also refresh when *total* changes (catalog goes 1 → N_cfg) — previously
-    # early-return on unchanged current left the blue bar stuck / invisible.
     last_c = _job.get("last_ui_current")
     last_t = _job.get("last_ui_total")
-    if not force_ui and cur == last_c and tot == last_t:
+    try:
+        last_cf = float(last_c) if last_c is not None else None
+    except Exception:
+        last_cf = None
+    if (
+        not force_ui
+        and last_cf is not None
+        and tot == last_t
+        and abs(cur - last_cf) < 0.05
+    ):
         return
     _job["last_ui_current"] = cur
     _job["last_ui_total"] = tot
     handle = _job.get("progress_handle")
     if handle is not None:
-        # Title includes "N/M" so the blue bar text shows ile/na ile
         _progress_update(handle, cur, tot, display)
     else:
         try:
@@ -261,7 +326,7 @@ def _job_end():
     _job["progress_handle"] = None
     _job["kind"] = None
     _job["title"] = ""
-    _job["current"] = 0
+    _job["current"] = 0.0
     _job["total"] = 0
     _job["cancel"] = False
     _job["started"] = 0.0
@@ -391,17 +456,20 @@ def _poll_catalog_job():
 def _poll_thumbs_job():
     files = list(_job.get("progress_files") or [])
     procs = list(_job.get("procs") or [])
-    # Total is fixed at job start (len of queue). Only sum *current* from
-    # workers — otherwise tot_sum grows as async workers come online.
+    # Total is fixed at job start (len of queue). Sum fractional *current*
+    # from workers (e.g. 2.7 + 1.4 = 4.1) for smooth sub-item progress.
     fixed_total = max(1, int(_job.get("total") or 1))
-    cur_sum = 0
+    cur_sum = 0.0
     for pf in files:
         info = _read_progress_file(pf)
         if info:
             c, _t, _msg = info
-            cur_sum += c
+            try:
+                cur_sum += float(c)
+            except Exception:
+                pass
     if cur_sum > fixed_total:
-        cur_sum = fixed_total
+        cur_sum = float(fixed_total)
 
     _job_update(cur_sum, fixed_total, title=None)  # keep base_title + fixed total
 
@@ -583,6 +651,117 @@ def _thumb_work_dir() -> Path:
     return d
 
 
+def _estimate_thumb_cost(path: str, name: str = "") -> float:
+    """Heuristic cost for thumbnail generation (higher = slower, should run first).
+
+    Multi-level, cheap (no full MU parse):
+      1. .mu file size (dominant)
+      2. Path/name complexity keywords (IVA, FX, nested spaces, animations…)
+      3. Sibling .cfg size + quick keyword hits (MODEL/texture/anim proxies)
+      4. Presence of sibling texture files next to the .mu
+    """
+    cost = 0.0
+    try:
+        cost += float(os.path.getsize(path))
+    except OSError:
+        pass
+
+    key = ("%s/%s" % (path or "", name or "")).lower().replace("\\", "/")
+
+    # Heavy geometry / nested content
+    for kw, w in (
+        ("freeiva", 8e5),
+        ("/spaces/", 5e5),
+        ("_iva", 4e5),
+        ("/iva/", 4e5),
+        ("internal", 3e5),
+        ("/fx/", 3e5),
+        ("plume", 2.5e5),
+        ("particle", 2e5),
+        ("waterfall", 2e5),
+        ("anim", 1.5e5),
+        ("engine", 1e5),
+        ("fairing", 8e4),
+        ("shroud", 6e4),
+        ("collider", -5e4),  # pure colliders finish almost instantly (placeholder)
+        ("/col", -3e4),
+        ("depthmask", -4e4),
+        ("overlaymask", -4e4),
+        ("mask", -2e4),
+    ):
+        if kw in key:
+            cost += w
+
+    # Sibling cfg: size + cheap keyword scan (textures / models / anim)
+    try:
+        base, _ = os.path.splitext(path)
+        cfg = base + ".cfg"
+        if not os.path.isfile(cfg):
+            # often part.cfg sits next to the mu with a different stem
+            parent = os.path.dirname(path)
+            for fn in os.listdir(parent) if os.path.isdir(parent) else []:
+                if fn.lower().endswith(".cfg"):
+                    cfg = os.path.join(parent, fn)
+                    break
+            else:
+                cfg = ""
+        if cfg and os.path.isfile(cfg):
+            try:
+                cost += 0.25 * float(os.path.getsize(cfg))
+            except OSError:
+                pass
+            try:
+                # Cap read — enough for MODEL/texture/anim blocks
+                with open(cfg, "r", encoding="utf-8", errors="ignore") as fh:
+                    text = fh.read(65536).lower()
+                for kw, w in (
+                    ("texture", 4e4),
+                    ("model", 3e4),
+                    ("mesh", 2e4),
+                    ("animation", 5e4),
+                    ("anim", 2e4),
+                    ("fx", 2e4),
+                    ("emitter", 3e4),
+                    ("module", 5e3),
+                ):
+                    cost += text.count(kw) * w
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Sibling textures next to the .mu (rough proxy for material complexity)
+    try:
+        parent = os.path.dirname(path)
+        if os.path.isdir(parent):
+            tex_n = 0
+            for fn in os.listdir(parent):
+                low = fn.lower()
+                if low.endswith((".dds", ".png", ".mbm", ".tga", ".jpg", ".jpeg")):
+                    tex_n += 1
+                    if tex_n >= 24:
+                        break
+            cost += tex_n * 2.5e4
+    except Exception:
+        pass
+
+    return cost
+
+
+def _sort_thumb_queue_heaviest_first(queue):
+    """Sort queue in-place: longest expected renders first, shortest last."""
+    if len(queue) <= 1:
+        return queue
+    scored = []
+    for item in queue:
+        path = item[0] if item else ""
+        name = item[1] if item and len(item) > 1 else ""
+        scored.append((_estimate_thumb_cost(path, name), item))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    queue[:] = [item for _, item in scored]
+    return queue
+
+
 def _thumb_queue(br, *, force: bool, max_count: int):
     from . import thumbnails
     queue = []
@@ -619,6 +798,20 @@ def _thumb_queue(br, *, force: bool, max_count: int):
             if dev:
                 print("[mu_thumb][DEV] QUEUE STOP: max_count=%d reached at index=%d" % (int(max_count), idx), flush=True)
             break
+    # Heaviest first so long IVA/FX/engine thumbs start while short colliders
+    # finish at the tail (better wall-clock with parallel workers).
+    _sort_thumb_queue_heaviest_first(queue)
+    if dev and queue:
+        try:
+            head = queue[0][0] if queue else ""
+            tail = queue[-1][0] if queue else ""
+            print(
+                "[mu_thumb][DEV] QUEUE SORTED heaviest-first: %d jobs | first=%s | last=%s"
+                % (len(queue), os.path.basename(head), os.path.basename(tail)),
+                flush=True,
+            )
+        except Exception:
+            pass
     if dev:
         print("[mu_thumb][DEV] QUEUE RESULT: %d jobs from %d browser parts" % (len(queue), len(br.parts)), flush=True)
     return queue
@@ -635,13 +828,14 @@ def _split_queue(need_items, n_workers):
 
 
 def _read_progress_file(path):
+    """Parse worker progress file. *current* may be fractional (one decimal)."""
     try:
         text = Path(path).read_text(encoding="utf-8").strip()
         if not text:
             return None
         parts = text.split("\t")
-        cur = int(parts[0])
-        tot = int(parts[1]) if len(parts) > 1 else 0
+        cur = float(parts[0])
+        tot = int(float(parts[1])) if len(parts) > 1 else 0
         msg = parts[2] if len(parts) > 2 else ""
         return cur, tot, msg
     except Exception:
@@ -857,7 +1051,7 @@ class KSPMU_OT_MuBrowserGenThumbs(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     force: BoolProperty(default=False)
-    max_count: IntProperty(default=200, min=1, max=500)
+    max_count: IntProperty(default=2000, min=1, max=5000)
 
     def execute(self, context):
         result = _start_thumbs_job(
@@ -885,7 +1079,7 @@ class KSPMU_OT_MuBrowserRegenThumbs(bpy.types.Operator):
     bl_options = {"REGISTER"}
 
     force: BoolProperty(default=True)
-    max_count: IntProperty(default=200, min=1, max=500)
+    max_count: IntProperty(default=2000, min=1, max=5000)
 
     def execute(self, context):
         result = _start_thumbs_job(
@@ -979,49 +1173,197 @@ def _parse_cfg_attach_nodes(cfg_path):
         out.append((m.group(1), _unity_pos_to_blender(ux, uy, uz)))
     return out
 
-def _make_attach_marker(col, location, index, label):
-    bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8, radius=ATTACH_VIEW_RADIUS, location=location)
-    obj=bpy.context.object
-    obj.name=f"{_ATTACH_PREFIX}{index:03d}"
-    obj["ksp_attach_node"]=label
-    obj.color=ATTACH_VIEW_COLOR
-    mat=bpy.data.materials.new(f"MU Attach Point {index:03d}")
-    mat.diffuse_color=ATTACH_VIEW_COLOR
-    mat.use_nodes=True
+def _make_attach_marker(col, location, index, label, *, parent=None, local_pos=None):
+    """Create a green attach-point sphere without stealing viewport selection.
+
+    If *parent* is given, the marker is parented so it follows part/node
+    animation. *local_pos* is the translation in parent local space (CFG
+    model-space already converted to Blender axes).
+    """
+    mesh = bpy.data.meshes.new(f"{_ATTACH_PREFIX}{index:03d}_mesh")
+    # Low-poly UV sphere via bmesh — no bpy.ops, so selection stays intact.
     try:
-        bsdf=next(n for n in mat.node_tree.nodes if n.type=='BSDF_PRINCIPLED')
-        bsdf.inputs['Base Color'].default_value=ATTACH_VIEW_COLOR
-        bsdf.inputs['Alpha'].default_value=ATTACH_VIEW_ALPHA
-        if 'Roughness' in bsdf.inputs: bsdf.inputs['Roughness'].default_value=0.2
-        if 'Emission Color' in bsdf.inputs: bsdf.inputs['Emission Color'].default_value=ATTACH_VIEW_COLOR
-        if 'Emission Strength' in bsdf.inputs: bsdf.inputs['Emission Strength'].default_value=0.25
-    except Exception: pass
-    try: mat.surface_render_method='DITHERED'
-    except Exception: pass
-    obj.data.materials.append(mat)
-    for c in list(obj.users_collection):
-        try: c.objects.unlink(obj)
-        except Exception: pass
+        import bmesh
+        bm = bmesh.new()
+        bmesh.ops.create_uvsphere(
+            bm,
+            u_segments=16,
+            v_segments=8,
+            radius=float(ATTACH_VIEW_RADIUS),
+        )
+        bm.to_mesh(mesh)
+        bm.free()
+    except Exception:
+        # Fallback: single-vert "point" if bmesh fails
+        mesh.from_pydata([(0, 0, 0)], [], [])
+        mesh.update()
+
+    obj = bpy.data.objects.new(f"{_ATTACH_PREFIX}{index:03d}", mesh)
+    obj["ksp_attach_node"] = label
+    obj.color = ATTACH_VIEW_COLOR
+    # Helpers only — never become the active/selected object.
+    try:
+        obj.hide_select = True
+    except Exception:
+        pass
+    try:
+        obj.show_name = False
+    except Exception:
+        pass
+
+    mat = bpy.data.materials.new(f"MU Attach Point {index:03d}")
+    mat.diffuse_color = ATTACH_VIEW_COLOR
+    mat.use_nodes = True
+    try:
+        bsdf = next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+        bsdf.inputs["Base Color"].default_value = ATTACH_VIEW_COLOR
+        bsdf.inputs["Alpha"].default_value = ATTACH_VIEW_ALPHA
+        if "Roughness" in bsdf.inputs:
+            bsdf.inputs["Roughness"].default_value = 0.2
+        if "Emission Color" in bsdf.inputs:
+            bsdf.inputs["Emission Color"].default_value = ATTACH_VIEW_COLOR
+        if "Emission Strength" in bsdf.inputs:
+            bsdf.inputs["Emission Strength"].default_value = 0.25
+    except Exception:
+        pass
+    try:
+        mat.surface_render_method = "DITHERED"
+    except Exception:
+        pass
+    try:
+        mesh.materials.append(mat)
+    except Exception:
+        pass
+
     col.objects.link(obj)
+
+    if parent is not None:
+        try:
+            obj.parent = parent
+            if local_pos is not None:
+                obj.location = local_pos
+            else:
+                # Keep world position at *location* under this parent.
+                from mathutils import Matrix, Vector
+                mw = Matrix.Translation(Vector(location))
+                obj.matrix_world = mw
+                # Re-express as parent-local after parenting.
+                obj.matrix_parent_inverse = parent.matrix_world.inverted()
+                obj.location = parent.matrix_world.inverted() @ Vector(location)
+                obj.rotation_euler = (0, 0, 0)
+                obj.scale = (1, 1, 1)
+        except Exception:
+            try:
+                obj.location = location
+            except Exception:
+                pass
+    else:
+        try:
+            obj.location = location
+        except Exception:
+            pass
     return obj
 
-def update_attach_point_markers(context, enabled):
-    scene=bpy.context.scene
-    _clear_attach_markers(scene)
-    if not enabled: return 0
-    from mathutils import Vector
-    roots=[]
-    for obj in scene.objects:
+
+def _find_node_empty(root, node_key):
+    """Match CFG node name to an imported EMPTY (e.g. node_stack_top)."""
+    if root is None or not node_key:
+        return None
+    key = str(node_key).lower().strip()
+    try:
+        objs = [root] + list(getattr(root, "children_recursive", []) or [])
+    except Exception:
+        objs = [root]
+    for obj in objs:
         try:
-            if obj.parent is None and obj.get('ksp_mu_path') and obj.get('ksp_part_name'): roots.append(obj)
-        except Exception: pass
-    col=_attach_collection(scene)
-    count=0
-    for root in roots:
-        cfg=str(root.get('ksp_cfg_path') or Path(str(root.get('ksp_mu_path'))).with_suffix('.cfg'))
-        for key,pos in _parse_cfg_attach_nodes(cfg):
-            _make_attach_marker(col, root.matrix_world @ Vector(pos), count, key)
-            count+=1
+            if getattr(obj, "type", None) != "EMPTY":
+                continue
+            n = (obj.name or "").lower()
+            # Exact / startswith — Blender may suffix .001
+            if n == key or n.startswith(key + ".") or n.startswith(key + "_"):
+                return obj
+        except Exception:
+            pass
+    return None
+
+
+def update_attach_point_markers(context, enabled):
+    """Show/hide green attach markers. Never changes the user's selection."""
+    scene = bpy.context.scene
+
+    # Snapshot selection + active — sphere ops used to steal both.
+    prev_active = None
+    prev_selected = []
+    try:
+        prev_active = getattr(context.view_layer.objects, "active", None)
+    except Exception:
+        pass
+    try:
+        prev_selected = [o for o in context.selected_objects]
+    except Exception:
+        try:
+            prev_selected = [o for o in scene.objects if getattr(o, "select_get", lambda: False)()]
+        except Exception:
+            prev_selected = []
+
+    _clear_attach_markers(scene)
+    count = 0
+    if enabled:
+        from mathutils import Vector
+        roots = []
+        for obj in scene.objects:
+            try:
+                if obj.parent is None and obj.get("ksp_mu_path") and obj.get("ksp_part_name"):
+                    roots.append(obj)
+            except Exception:
+                pass
+        col = _attach_collection(scene)
+        for root in roots:
+            cfg = str(
+                root.get("ksp_cfg_path")
+                or Path(str(root.get("ksp_mu_path"))).with_suffix(".cfg")
+            )
+            for key, pos in _parse_cfg_attach_nodes(cfg):
+                local = Vector(pos)
+                # Prefer the real node EMPTY so markers ride node/armature anim.
+                node_empty = _find_node_empty(root, key)
+                parent = node_empty if node_empty is not None else root
+                # CFG coords are model-space relative to the part root.
+                # If parent is a node empty, put marker at local origin (empty
+                # already sits on the attach point). If parent is root, use CFG pos.
+                if node_empty is not None:
+                    _make_attach_marker(
+                        col, node_empty.matrix_world.translation, count, key,
+                        parent=node_empty, local_pos=(0.0, 0.0, 0.0),
+                    )
+                else:
+                    world = root.matrix_world @ local
+                    _make_attach_marker(
+                        col, world, count, key,
+                        parent=root, local_pos=local,
+                    )
+                count += 1
+
+    # Restore previous selection exactly.
+    try:
+        for o in list(getattr(context, "selected_objects", []) or []):
+            try:
+                o.select_set(False)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    for o in prev_selected:
+        try:
+            if o.name in scene.objects:
+                o.select_set(True)
+        except Exception:
+            pass
+    try:
+        if prev_active is not None and prev_active.name in scene.objects:
+            context.view_layer.objects.active = prev_active
+    except Exception:
+        pass
     return count
 
 

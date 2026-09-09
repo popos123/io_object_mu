@@ -207,6 +207,43 @@ _PREVIEW_ENUM_CACHE = {
     "icon_rev": 0,
 }
 
+# cfg_path → "[B9]" / "[V]" / ""  (cheap head-read, cached)
+_VARIANT_TAG_CACHE = {}
+
+
+def _variant_source_tag(cfg_path: str) -> str:
+    """Return [B9] and/or [V] if the part.cfg declares those switch modules.
+
+    Overlay on 8×8 thumbs is not possible without regenerating PNGs, so we
+    mark the label under the icon instead (template_icon_view show_labels).
+    """
+    if not cfg_path:
+        return ""
+    if cfg_path in _VARIANT_TAG_CACHE:
+        return _VARIANT_TAG_CACHE[cfg_path]
+    tag = ""
+    try:
+        import os
+        if not os.path.isfile(cfg_path):
+            _VARIANT_TAG_CACHE[cfg_path] = ""
+            return ""
+        # Only need MODULE names — first 48 KiB covers almost every part.cfg
+        with open(cfg_path, "r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(49152)
+        low = head.lower()
+        has_b9 = "moduleb9partswitch" in low
+        has_v = "modulepartvariants" in low
+        if has_b9 and has_v:
+            tag = "[B9][V]"
+        elif has_b9:
+            tag = "[B9]"
+        elif has_v:
+            tag = "[V]"
+    except Exception:
+        tag = ""
+    _VARIANT_TAG_CACHE[cfg_path] = tag
+    return tag
+
 
 def bump_preview_enum_icons():
     """Call after warmup loads more icons so the open popup can refresh."""
@@ -259,7 +296,13 @@ def _preview_items(self, context):
     for i in range(n):
         item = parts[i]
         identifier = _enum_cache_string("PART_%d" % i)
-        title = _enum_cache_string(_safe_text(item.title))
+        # Tag stock ModulePartVariants [V] and B9PartSwitch [B9] in the label
+        # (template_icon_view shows this text under the 8×8 thumb — no regen).
+        raw_title = _safe_text(item.title) or _safe_text(item.name) or "?"
+        tag = _variant_source_tag(getattr(item, "cfg_path", "") or "")
+        if tag and tag not in raw_title:
+            raw_title = "%s %s" % (raw_title, tag)
+        title = _enum_cache_string(raw_title)
         name = _enum_cache_string(_safe_text(item.name))
         icon_id = 0
         if peek is not None:

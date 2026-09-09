@@ -597,6 +597,89 @@ def _set_shroud_fairing_hide(objects, hide):
     return n
 
 
+def _cfg_broken_names_for(obj):
+    """Broken transform names stored on the import root (from .cfg)."""
+    names = set()
+    try:
+        cur = obj
+        while cur is not None:
+            raw = cur.get("mu_broken_names")
+            if raw:
+                try:
+                    for n in json.loads(raw):
+                        if n:
+                            names.add(str(n).lower())
+                except Exception:
+                    pass
+                break
+            cur = cur.parent
+    except Exception:
+        pass
+    return names
+
+
+def _is_broken_object(obj):
+    """Damaged visual: .broken / busted / cfg damagedTransformName, etc."""
+    if not obj:
+        return False
+    name = obj.name or ""
+    if not name:
+        return False
+    n = name.lower()
+    wedge = "\u2227"
+    key = n.split("\u2227", 1)[0].strip()
+    cfg_names = _cfg_broken_names_for(obj)
+    for bn in cfg_names:
+        if key == bn or key.startswith(bn + ".") or bn in key:
+            return True
+    if ".broken" in n or n.endswith("broken") or "_broken" in n:
+        return True
+    if "busted" in n or n.startswith("damaged") or ".damaged" in n:
+        return True
+    return False
+
+
+def _set_broken_hide(objects, hide):
+    """Hide each broken root and its full child hierarchy (meshes + colliders)."""
+    n = 0
+    seen = set()
+    for obj in objects:
+        if not _is_broken_object(obj):
+            continue
+        # Skip if an ancestor is already being hidden as broken
+        try:
+            p = obj.parent
+            skip = False
+            while p is not None:
+                if _is_broken_object(p):
+                    skip = True
+                    break
+                p = p.parent
+            if skip:
+                continue
+        except Exception:
+            pass
+        try:
+            branch = [obj] + list(getattr(obj, "children_recursive", []) or [])
+        except Exception:
+            branch = [obj]
+        for o in branch:
+            try:
+                k = o.as_pointer()
+                if k in seen:
+                    continue
+                seen.add(k)
+                o.hide_viewport = hide
+                try:
+                    o.hide_render = hide
+                except Exception:
+                    pass
+                n += 1
+            except Exception:
+                pass
+    return n
+
+
 def _mute_normal_nodes(node_tree, mute):
     if not node_tree:
         return 0
@@ -710,6 +793,58 @@ class KSPMU_OT_ToggleShroudFairing(bpy.types.Operator):
         self.report(
             {'INFO'},
             f"{'Hidden' if hide else 'Shown'} {n} shroud/fairing object(s)",
+        )
+        return {'FINISHED'}
+
+
+
+class KSPMU_OT_ToggleBroken(bpy.types.Operator):
+    bl_idname = "object.mu_toggle_broken"
+    bl_label = "Toggle Broken / Damaged"
+    bl_description = (
+        "Show or hide damaged meshes (.broken, busted wheel, "
+        "ModuleWheelDamage damagedTransformName). Default: hidden"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    scope: bpy.props.EnumProperty(
+        name="Scope",
+        items=(
+            ('ALL', "All in Scene", "All broken/damaged objects in the scene"),
+            ('SELECTED', "Selected Hierarchy",
+             "Active/selected object and children"),
+            ('COLLECTION', "Active Collection",
+             "Objects in the active collection"),
+        ),
+        default='ALL',
+    )
+    force: bpy.props.EnumProperty(
+        name="Mode",
+        items=(
+            ('TOGGLE', "Toggle", "Invert current visibility"),
+            ('HIDE', "Hide", "Hide broken/damaged meshes"),
+            ('SHOW', "Show", "Show broken/damaged meshes"),
+        ),
+        default='TOGGLE',
+    )
+
+    def execute(self, context):
+        objs = [o for o in _iter_scope_objects(context, self.scope)
+                if _is_broken_object(o)]
+        if not objs:
+            self.report({'INFO'}, "No broken/damaged objects in scope")
+            return {'CANCELLED'}
+        if self.force == 'HIDE':
+            hide = True
+        elif self.force == 'SHOW':
+            hide = False
+        else:
+            hidden = sum(1 for o in objs if o.hide_viewport)
+            hide = hidden < len(objs) / 2
+        n = _set_broken_hide(objs, hide)
+        self.report(
+            {'INFO'},
+            f"{'Hidden' if hide else 'Shown'} {n} broken/damaged object(s)",
         )
         return {'FINISHED'}
 
@@ -1333,6 +1468,19 @@ class WORKSPACE_PT_mu_options(bpy.types.Panel):
         op.scope = 'COLLECTION'
         op.force = 'TOGGLE'
         col.separator()
+        col.label(text="Broken / Damaged")
+        row = col.row(align=True)
+        op = row.operator("object.mu_toggle_broken", text="Toggle All")
+        op.scope = 'ALL'
+        op.force = 'TOGGLE'
+        row = col.row(align=True)
+        op = row.operator("object.mu_toggle_broken", text="Selected")
+        op.scope = 'SELECTED'
+        op.force = 'TOGGLE'
+        op = row.operator("object.mu_toggle_broken", text="Collection")
+        op.scope = 'COLLECTION'
+        op.force = 'TOGGLE'
+        col.separator()
         col.label(text="KSP - Game Path")
         try:
             from ..preferences import Preferences
@@ -1371,7 +1519,7 @@ def register():
     if not hasattr(bpy.types.Scene, "mu_active_variant"):
         bpy.types.Scene.mu_active_variant = bpy.props.EnumProperty(
             name="Part Variant",
-            description="Active ModulePartVariants preview (viewport only)",
+            description="Active ModulePartVariants / B9PartSwitch preview (viewport only)",
             items=_variant_enum_items,
             update=_update_part_variant,
         )
@@ -1430,6 +1578,7 @@ def unregister():
 classes_to_register = (
     KSPMU_OT_ToggleColliders,
     KSPMU_OT_ToggleShroudFairing,
+    KSPMU_OT_ToggleBroken,
     KSPMU_OT_ToggleBumpPreview,
     KSPMU_OT_ToggleParticlesPreview,
     KSPMU_OT_AddPartVariant,

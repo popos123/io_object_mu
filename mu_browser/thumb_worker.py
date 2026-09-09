@@ -45,9 +45,18 @@ def _has_flag(argv, flag):
 
 
 def _write_progress(path, current, total, message=""):
+    """Write progress. *current* may be fractional (e.g. 3.4 = item 3 + 40%).
+
+    Format (UTF-8, single line)::
+        <current>\\t<total>\\t<status_message>
+
+    current is written with one decimal place so the UI can show smooth
+    sub-item progress without measurable overhead (tiny file rewrite only).
+    """
     try:
-        text = "%d\t%d\t%s\n" % (int(current), int(total), message or "")
-        # atomic-ish replace
+        cur = float(current)
+        # One decimal is enough for stage granularity; avoids float noise.
+        text = "%.1f\t%d\t%s\n" % (cur, int(total), message or "")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -174,9 +183,25 @@ def main():
     dev = bool(getattr(thumbs, "DEV_OVERLAY", 0))
     for i, (path, name) in enumerate(jobs):
         label = name or os.path.basename(path) or "?"
-        _write_progress(progress, i, total, "")
+
+        def _stage(frac, msg="", _i=i, _label=label):
+            # frac in [0, 1) within this item → overall current = i + frac
+            try:
+                f = max(0.0, min(0.99, float(frac)))
+            except Exception:
+                f = 0.0
+            _write_progress(progress, _i + f, total, msg or _label)
+
+        _stage(0.0, "start %s" % label)
         try:
-            result = generate(path, name, force=force, show_attach_points=show_attach_points)
+            # progress_cb is optional; older generate_thumbnail ignores it.
+            try:
+                result = generate(
+                    path, name, force=force, show_attach_points=show_attach_points,
+                    progress_cb=_stage,
+                )
+            except TypeError:
+                result = generate(path, name, force=force, show_attach_points=show_attach_points)
             if result:
                 done += 1
             elif dev:
@@ -187,7 +212,7 @@ def main():
             if dev:
                 print("[mu_thumb_worker][DEV] GENERATION EXCEPTION | %s | %s | %s: %s" % (path, name, type(e).__name__, e), flush=True)
                 traceback.print_exc()
-        _write_progress(progress, i + 1, total, "")
+        _write_progress(progress, i + 1, total, "done %s" % label)
 
     if dev and failed:
         print("[mu_thumb_worker][DEV] DONE: success=%d failed=%d total=%d" % (done, failed, total), flush=True)

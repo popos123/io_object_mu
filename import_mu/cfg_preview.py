@@ -28,6 +28,7 @@ _CFG_PREVIEW_SUFFIX = ".cfg_preview"
 _flag_preview_import_failed = False  # set if flag_preview.py is corrupt (UTF-16/nulls)
 MU_VARIANTS_KEY = "mu_variants"
 MU_COLOR_CHANGER_KEY = "mu_color_changer"
+MU_BROKEN_KEY = "mu_broken_names"
 MU_JETTISON_KEY = "mu_jettison_names"
 # Implicit KSP look when cfg has VARIANT blocks but no baseVariant= —
 # stock .mu materials (e.g. Serenity "Gray with Stripes" color DDS).
@@ -383,6 +384,654 @@ def parse_module_jettison_names(cfg_text):
     return names
 
 
+
+def _parse_brace_blocks(text, keyword):
+    """Yield body strings of KEYWORD { ... } with correct brace depth."""
+    if not text:
+        return
+    for m in re.finditer(rf"{keyword}\s*\{{", text, re.I):
+        s0 = m.end() - 1
+        depth = 0
+        j = s0
+        while j < len(text):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    yield text[s0 + 1:j]
+                    break
+            j += 1
+
+
+def _parse_b9_texture_block(body):
+    """Parse one B9 SUBTYPE → TEXTURE { ... } block into a dict."""
+    tex = {
+        "texture": None,
+        "currentTexture": None,
+        "isNormalMap": False,
+        "shaderProperty": None,
+        "transforms": [],
+        "baseTransforms": [],
+    }
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("//") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip().lower()
+        v = v.strip().split("//")[0].strip().strip('"')
+        if k == "texture":
+            tex["texture"] = v
+        elif k == "currenttexture":
+            tex["currentTexture"] = v
+        elif k == "isnormalmap":
+            tex["isNormalMap"] = v.lower() in ("true", "1", "yes")
+        elif k == "shaderproperty":
+            tex["shaderProperty"] = v
+        elif k == "transform":
+            if v:
+                tex["transforms"].append(v)
+        elif k == "basetransform":
+            if v:
+                tex["baseTransforms"].append(v)
+    if not tex["texture"]:
+        return None
+    if not tex["shaderProperty"]:
+        tex["shaderProperty"] = "_BumpMap" if tex["isNormalMap"] else "_MainTex"
+    return tex
+
+
+def parse_b9_part_switch(cfg_text):
+    """Parse ModuleB9PartSwitch: transforms + full TEXTURE nodes per SUBTYPE.
+
+    B9 enables listed transforms per subtype and disables the rest. TEXTURE
+    blocks swap maps (optionally filtered by currentTexture / transform /
+    baseTransform / shaderProperty / isNormalMap) — same coverage as the
+    in-game plugin for viewport preview.
+    """
+    if not cfg_text or "ModuleB9PartSwitch" not in cfg_text:
+        return None
+    modules = []
+    for body in _parse_brace_blocks(cfg_text, "MODULE"):
+        if not re.search(r"^\s*name\s*=\s*ModuleB9PartSwitch\b", body, re.M | re.I):
+            continue
+        mid = re.search(r"^\s*moduleID\s*=\s*(.+)$", body, re.M | re.I)
+        module_id = (
+            mid.group(1).strip().strip('"').split("//")[0].strip()
+            if mid else "B9"
+        )
+        subtypes = []
+        all_transforms = set()
+        for sbody in _parse_brace_blocks(body, "SUBTYPE"):
+            nm = re.search(r"^\s*name\s*=\s*(.+)$", sbody, re.M | re.I)
+            if not nm:
+                continue
+            sname = nm.group(1).strip().strip('"').split("//")[0].strip()
+            title_m = re.search(r"^\s*title\s*=\s*(.+)$", sbody, re.M | re.I)
+            title = (
+                title_m.group(1).strip().strip('"').split("//")[0].strip()
+                if title_m else sname
+            )
+            transforms = []
+            for line in sbody.splitlines():
+                line = line.strip()
+                # Only top-level transform = (not inside TEXTURE/TRANSFORM nodes)
+                # Approximate: skip lines after we already collected from bare lines
+                # by only reading lines that are direct "transform =" not nested keys
+                if re.match(r"(?i)^transform\s*=", line):
+                    _, _, v = line.partition("=")
+                    t = v.strip().split("//")[0].strip().strip('"')
+                    if t:
+                        transforms.append(t)
+                        all_transforms.add(t)
+            textures = []
+            for tbody in _parse_brace_blocks(sbody, "TEXTURE"):
+                td = _parse_b9_texture_block(tbody)
+                if td:
+                    textures.append(td)
+            subtypes.append({
+                "name": sname,
+                "title": title,
+                "transforms": transforms,
+                "textures": textures,
+            })
+        if not subtypes:
+            continue
+        modules.append({
+            "moduleID": module_id,
+            "subtypes": subtypes,
+            "all_transforms": sorted(all_transforms),
+        })
+    return modules or None
+
+
+def b9_to_variant_info(modules):
+    """Convert B9 modules into a ModulePartVariants-compatible info dict.
+
+    ``textures`` is kept as a list of B9 TEXTURE descriptors under key
+    ``b9_textures`` (applied by ``_apply_b9_textures``). Flat slot map is
+    also filled for the simple single-TEXTURE case so stock path still works.
+    """
+    if not modules:
+        return None
+    variants = []
+    base = None
+    has_tex = False
+    has_obj = False
+    for mod in modules:
+        mid = mod.get("moduleID") or "B9"
+        all_t = mod.get("all_transforms") or []
+        for i, st in enumerate(mod.get("subtypes") or []):
+            sname = st.get("name") or ("Subtype%d" % i)
+            enum_name = ("%s/%s" % (mid, sname)) if len(modules) > 1 else sname
+            enabled = set(st.get("transforms") or [])
+            objects = {}
+            for t in all_t:
+                objects[t] = t in enabled
+            if objects:
+                has_obj = True
+            b9_tex = list(st.get("textures") or [])
+            if b9_tex:
+                has_tex = True
+            # Flat map for the common single _MainTex case (ModulePartVariants path)
+            flat = {}
+            for td in b9_tex:
+                slot = td.get("shaderProperty") or (
+                    "_BumpMap" if td.get("isNormalMap") else "_MainTex"
+                )
+                url = td.get("texture")
+                if url and slot not in flat:
+                    flat[slot] = url
+                    if slot == "_MainTex":
+                        flat["mainTextureURL"] = url
+            entry = {
+                "name": enum_name,
+                "displayName": st.get("title") or sname,
+                "objects": objects,
+                "textures": flat,
+                "b9_textures": b9_tex,
+                "b9": True,
+                "b9_moduleID": mid,
+            }
+            variants.append(entry)
+            if base is None:
+                base = enum_name
+    if not variants:
+        return None
+    kind = "both" if (has_obj and has_tex) else ("texture" if has_tex else "model")
+    return {
+        "base": base,
+        "variants": variants,
+        "kind": kind,
+        "source": "B9PartSwitch",
+    }
+
+
+def _object_key_plain(name):
+    n = (name or "").split("\u2227", 1)[0].strip()
+    return n
+
+
+def _collect_objects_for_b9_tex(root, transforms, base_transforms):
+    """Objects targeted by B9 TEXTURE transform / baseTransform filters.
+
+    Empty filters → entire hierarchy under root.
+    """
+    try:
+        stack = [root] + list(getattr(root, "children_recursive", []) or [])
+    except Exception:
+        stack = [root]
+    if not transforms and not base_transforms:
+        return list(stack)
+    wanted = set()
+    tset = {str(t).lower() for t in (transforms or [])}
+    bset = {str(t).lower() for t in (base_transforms or [])}
+    by_key = {}
+    for o in stack:
+        try:
+            key = _object_key_plain(o.name).lower()
+            by_key.setdefault(key, []).append(o)
+            # Blender may suffix .001
+            base = key.split(".", 1)[0]
+            by_key.setdefault(base, []).append(o)
+        except Exception:
+            pass
+    for t in tset:
+        for o in by_key.get(t, []):
+            wanted.add(o)
+    for t in bset:
+        for o in by_key.get(t, []):
+            wanted.add(o)
+            try:
+                for ch in getattr(o, "children_recursive", []) or []:
+                    wanted.add(ch)
+            except Exception:
+                pass
+    return list(wanted) if wanted else list(stack)
+
+
+def _materials_on_objects(objs):
+    mats = []
+    seen = set()
+    for o in objs or []:
+        for slot in getattr(o, "material_slots", []) or []:
+            mat = slot.material
+            if mat is None:
+                continue
+            k = mat.as_pointer()
+            if k in seen:
+                continue
+            seen.add(k)
+            mats.append(mat)
+    return mats
+
+
+def _image_name_stem(img):
+    if img is None:
+        return ""
+    try:
+        n = img.name or ""
+    except Exception:
+        n = ""
+    if not n:
+        try:
+            n = os.path.basename(bpy.path.abspath(img.filepath) or "")
+        except Exception:
+            n = ""
+    return os.path.splitext(n)[0].lower()
+
+
+def _apply_b9_textures(root, data, chosen):
+    """Full B9PartSwitch TEXTURE node application (viewport).
+
+    Supports:
+      texture, currentTexture, isNormalMap, shaderProperty,
+      transform (multi), baseTransform (multi, +children).
+    """
+    entries = chosen.get("b9_textures") or []
+    if not entries:
+        return
+    _ensure_default_textures_cached(root, data)
+    for td in entries:
+        url = td.get("texture")
+        if not url:
+            continue
+        path = _resolve_texture_url(root, url)
+        if not path:
+            # try as-is relative path with extensions
+            continue
+        img = _load_variant_image(
+            path, os.path.splitext(os.path.basename(path))[0]
+        )
+        if img is None:
+            continue
+        try:
+            if td.get("isNormalMap"):
+                img.colorspace_settings.name = "Non-Color"
+        except Exception:
+            pass
+        slot = td.get("shaderProperty") or (
+            "_BumpMap" if td.get("isNormalMap") else "_MainTex"
+        )
+        objs = _collect_objects_for_b9_tex(
+            root, td.get("transforms") or [], td.get("baseTransforms") or []
+        )
+        mats = _materials_on_objects(objs)
+        cur_want = (td.get("currentTexture") or "").strip().lower()
+        for mat in mats:
+            if cur_want:
+                # Only replace if the material currently uses this texture name
+                node = _maintex_image_node(mat) if slot == "_MainTex" else None
+                if node is None:
+                    try:
+                        from . import materials as _mats  # optional
+                    except Exception:
+                        pass
+                    # fallback: any image texture node for this slot
+                    try:
+                        nt = mat.node_tree
+                        if nt:
+                            for n in nt.nodes:
+                                if n.type == "TEX_IMAGE" and n.image:
+                                    if slot.lower() in (n.name or "").lower() or slot == "_MainTex":
+                                        node = n
+                                        break
+                    except Exception:
+                        pass
+                stem = _image_name_stem(node.image if node else None)
+                if stem and stem != cur_want and cur_want not in stem:
+                    continue
+            if slot == "_MainTex" and not _mat_had_stock_slot(data, mat, slot):
+                # still allow B9 swaps on mats that had a map; if stock empty skip
+                # unless currentTexture matched something
+                if not cur_want:
+                    try:
+                        if not any(
+                            n.type == "TEX_IMAGE" and n.image
+                            for n in (mat.node_tree.nodes if mat.node_tree else [])
+                        ):
+                            continue
+                    except Exception:
+                        continue
+            _set_material_slot_image_viewport(mat, slot, img, data=data)
+
+
+def parse_broken_transform_names(cfg_text):
+    """Collect mesh/transform names that represent the *damaged* visual.
+
+    Stock / mods:
+      - object names containing .broken / _broken / broken / busted
+      - ModuleWheelDamage: damagedTransformName / bustedWheelName
+      - ModuleDeployable*: damagedObjectName (when present)
+    """
+    names = set()
+    if not cfg_text:
+        return []
+    for key in (
+        "damagedTransformName",
+        "damagedObjectName",
+        "bustedWheelName",
+        "brokenObjectName",
+        "brokenTransformName",
+    ):
+        for m in re.finditer(
+            rf"^\s*{key}\s*=\s*(.+)$", cfg_text, re.M | re.I
+        ):
+            v = m.group(1).strip().strip('"').split("//")[0].strip()
+            if v:
+                names.add(v)
+    return sorted(names)
+
+
+def is_broken_object_name(name, cfg_broken_names=None):
+    """True if this Blender object is a damaged/broken visual mesh."""
+    n = (name or "").lower()
+    if not n:
+        return False
+    wedge = "\u2227"
+    key = n.split(wedge, 1)[0].strip()
+    if cfg_broken_names:
+        for bn in cfg_broken_names:
+            bl = str(bn).lower()
+            if key == bl or key.startswith(bl + ".") or bl in key:
+                return True
+    if ".broken" in n or n.endswith("broken") or "_broken" in n:
+        return True
+    if "busted" in n or n.startswith("damaged") or ".damaged" in n:
+        return True
+    return False
+
+
+def _hide_object_branch(obj, hide=True):
+    """Hide *obj* and every descendant (meshes, colliders, empties)."""
+    n = 0
+    if obj is None:
+        return 0
+    try:
+        branch = [obj] + list(getattr(obj, "children_recursive", []) or [])
+    except Exception:
+        branch = [obj]
+    for o in branch:
+        try:
+            o.hide_viewport = bool(hide)
+            o.hide_render = bool(hide)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def apply_broken_default_hide(root, cfg_text=None, hide=True):
+    """Hide broken meshes under root (viewport). Keep visible if *only* broken.
+
+    Debris / scrap parts that are entirely damaged geometry stay shown.
+    Hides the whole branch under each broken root (children colliders/meshes).
+    """
+    if root is None:
+        return 0
+    cfg_names = parse_broken_transform_names(cfg_text or "")
+    try:
+        stack = [root] + list(getattr(root, "children_recursive", []) or [])
+    except Exception:
+        stack = [root]
+    broken_roots = []
+    non_broken_mesh = 0
+    for obj in stack:
+        try:
+            if is_broken_object_name(obj.name, cfg_names):
+                # Only top-most broken in this branch (skip if parent already broken)
+                parent = getattr(obj, "parent", None)
+                skip = False
+                while parent is not None:
+                    if is_broken_object_name(getattr(parent, "name", ""), cfg_names):
+                        skip = True
+                        break
+                    parent = getattr(parent, "parent", None)
+                if not skip:
+                    broken_roots.append(obj)
+            elif getattr(obj, "type", None) == "MESH":
+                on = (obj.name or "").lower()
+                if "collider" in on or on.startswith("col"):
+                    continue
+                if is_broken_object_name(obj.name, cfg_names):
+                    continue
+                non_broken_mesh += 1
+        except Exception:
+            pass
+    if not broken_roots:
+        return 0
+    if non_broken_mesh == 0:
+        return 0
+    n = 0
+    for obj in broken_roots:
+        n += _hide_object_branch(obj, hide=hide)
+    try:
+        root[MU_BROKEN_KEY] = json.dumps(
+            [o.name for o in broken_roots if o and o.name]
+        )
+    except Exception:
+        pass
+    return n
+
+
+def _attach_suspension_preview(root, cfg_text):
+    """Synthesize a short location Action for ModuleWheelSuspension travel.
+
+    Moves ``suspensionTransformName`` along local +Z (Blender) by
+    ``suspensionDistance`` so amortyzatory / gear legs scrub in the Timeline.
+    Tagged ``mu_fx_preview`` / cfg_preview so export skips it.
+    """
+    if root is None or not cfg_text or "ModuleWheelSuspension" not in cfg_text:
+        return 0
+    try:
+        from ..utils.action_compat import fcurve_new, push_action_to_nla
+    except Exception:
+        return 0
+    import math
+
+    # Index objects under root once
+    named = {}
+    try:
+        stack = [root] + list(getattr(root, "children_recursive", []) or [])
+    except Exception:
+        stack = [root]
+    for o in stack:
+        try:
+            n = (o.name or "").split("\u2227", 1)[0].strip()
+            if n and n not in named:
+                named[n] = o
+            # also bare name
+            if o.name and o.name not in named:
+                named[o.name] = o
+        except Exception:
+            pass
+
+    count = 0
+    for m in re.finditer(r"MODULE\s*\{", cfg_text, re.I):
+        start = m.end() - 1
+        depth = 0
+        i = start
+        while i < len(cfg_text):
+            if cfg_text[i] == "{":
+                depth += 1
+            elif cfg_text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    body = cfg_text[start + 1:i]
+                    break
+            i += 1
+        else:
+            continue
+        if not re.search(r"^\s*name\s*=\s*ModuleWheelSuspension\b", body, re.M | re.I):
+            continue
+        tr = re.search(r"^\s*suspensionTransformName\s*=\s*(.+)$", body, re.M | re.I)
+        if not tr:
+            continue
+        tname = tr.group(1).strip().strip('"').split("//")[0].strip()
+        dist_m = re.search(r"^\s*suspensionDistance\s*=\s*([-\d.]+)", body, re.M | re.I)
+        try:
+            dist = float(dist_m.group(1)) if dist_m else 0.2
+        except Exception:
+            dist = 0.2
+        if abs(dist) < 1e-6:
+            continue
+        obj = named.get(tname)
+        if obj is None:
+            # fuzzy
+            tl = tname.lower()
+            for k, v in named.items():
+                if k.lower() == tl or k.lower().startswith(tl + "."):
+                    obj = v
+                    break
+        if obj is None:
+            continue
+        # Axis: Unity suspension is typically local Y → Blender local Z after import
+        axis = (0.0, 0.0, 1.0)
+        ax_m = re.search(
+            r"^\s*suspensionAxis\s*=\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)",
+            body, re.M | re.I,
+        )
+        if ax_m:
+            try:
+                # Unity Y-up → Blender Z-up: (x,y,z)_u → (x,z,y)_b
+                ux, uy, uz = (float(ax_m.group(i)) for i in (1, 2, 3))
+                axis = (ux, uz, uy)
+            except Exception:
+                pass
+        try:
+            rest = list(obj.location)
+        except Exception:
+            continue
+        # Visible travel on the timeline: ≥10 frames (user request), default 24.
+        f0 = 1
+        f1 = max(f0 + 10, f0 + 24)
+        # Ensure motion is visible even when cfg distance is tiny
+        travel = float(dist)
+        if abs(travel) < 0.05:
+            travel = 0.15 if travel >= 0 else -0.15
+        act_name = "Suspension_%s" % (obj.name.split("\u2227")[0][:40])
+        # Replace prior preview action of same name
+        try:
+            old = bpy.data.actions.get(act_name)
+            if old is not None:
+                bpy.data.actions.remove(old)
+        except Exception:
+            pass
+        act = bpy.data.actions.new(act_name)
+        try:
+            act["mu_fx_preview"] = 1
+            act["mu_cfg_preview"] = 1
+        except Exception:
+            pass
+        try:
+            ad = obj.animation_data
+            if ad and ad.nla_tracks:
+                for t in list(ad.nla_tracks):
+                    if (t.name or "").startswith("Suspension"):
+                        ad.nla_tracks.remove(t)
+        except Exception:
+            pass
+        # Intermediate keys so the strip is clearly multi-frame in the editor
+        frames = [f0]
+        steps = max(10, f1 - f0)
+        for s in range(1, steps):
+            frames.append(f0 + s)
+        frames.append(f1)
+        frames = sorted(set(int(x) for x in frames))
+        for i in range(3):
+            delta = float(axis[i]) * travel
+            try:
+                # Blender 4/5: fcurve_new(action, datablock, data_path, index)
+                fc = fcurve_new(act, obj, "location", index=i)
+            except TypeError:
+                try:
+                    fc = fcurve_new(act, "location", index=i)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            try:
+                while fc.keyframe_points:
+                    fc.keyframe_points.remove(fc.keyframe_points[0])
+            except Exception:
+                pass
+            try:
+                fc.keyframe_points.add(len(frames))
+            except Exception:
+                continue
+            for ki, fr in enumerate(frames):
+                t = 0.0 if f1 == f0 else (float(fr) - f0) / float(f1 - f0)
+                val = float(rest[i]) + delta * t
+                try:
+                    fc.keyframe_points[ki].co = (float(fr), val)
+                    fc.keyframe_points[ki].interpolation = "LINEAR"
+                except Exception:
+                    pass
+            try:
+                fc.update()
+            except Exception:
+                pass
+        try:
+            scene = bpy.context.scene
+            if scene and int(scene.frame_end) < f1:
+                scene.frame_end = int(f1)
+        except Exception:
+            pass
+        try:
+            track, strip = push_action_to_nla(obj, act, "SuspensionTravel")
+            if track is not None:
+                try:
+                    track.mute = False
+                except Exception:
+                    pass
+            if strip is not None:
+                try:
+                    strip.frame_start = float(f0)
+                    strip.frame_end = float(f1)
+                    strip.action_frame_start = float(f0)
+                    strip.action_frame_end = float(f1)
+                except Exception:
+                    pass
+            # Keep action assigned so Dope Sheet / timeline scrub shows motion
+            try:
+                if not obj.animation_data:
+                    obj.animation_data_create()
+                obj.animation_data.action = act
+            except Exception:
+                pass
+            count += 1
+        except Exception:
+            try:
+                if not obj.animation_data:
+                    obj.animation_data_create()
+                obj.animation_data.action = act
+                count += 1
+            except Exception:
+                pass
+    return count
+
+
 def parse_part_variants(cfg_text):
     """Return {base, variants:[{name, objects, textures, …}], kind}.
 
@@ -690,6 +1339,26 @@ def apply_part_cfg_preview(root, cfg_path, mudir=None, apply_base=True):
     except Exception:
         pass
     info = parse_part_variants(text)
+    if info is None:
+        # B9PartSwitch mesh/resource switches → same Options dropdown
+        try:
+            b9mods = parse_b9_part_switch(text)
+            info = b9_to_variant_info(b9mods)
+        except Exception as e:
+            print("WARNING: B9PartSwitch parse:", e)
+            info = None
+    elif "ModuleB9PartSwitch" in text:
+        # Merge B9 subtypes as extra variants (prefixed when needed)
+        try:
+            b9mods = parse_b9_part_switch(text)
+            b9info = b9_to_variant_info(b9mods)
+            if b9info and b9info.get("variants"):
+                existing = {v.get("name") for v in info.get("variants") or []}
+                for v in b9info["variants"]:
+                    if v.get("name") not in existing:
+                        info.setdefault("variants", []).append(v)
+        except Exception as e:
+            print("WARNING: B9PartSwitch merge:", e)
     if info:
         # Keep stock texture snapshot from import_mu.attach_cfg (must not
         # re-cache after a variant TEXTURE swap — that poisons restore/export).
@@ -1611,8 +2280,15 @@ def _set_material_slot_image(mat, slot_name, img):
 
 
 def _apply_variant_textures(root, data, chosen):
-    """Apply ModulePartVariants TEXTURE { mainTextureURL / _BumpMap / … } switches."""
+    """Apply ModulePartVariants TEXTURE + B9PartSwitch TEXTURE switches."""
     _ensure_default_textures_cached(root, data)
+    # Full B9 TEXTURE nodes (transform-scoped, currentTexture, normals…)
+    if chosen.get("b9_textures"):
+        try:
+            _apply_b9_textures(root, data, chosen)
+        except Exception as e:
+            print("WARNING: B9 TEXTURE apply:", e)
+        # Still fall through for any flat slot map on the same subtype
     defaults = data.get("_default_maintex") or {}
     tex_map = chosen.get("textures") or {}
     mats = list(_iter_materials_under(root))
@@ -2023,6 +2699,16 @@ def attach_cfg_viewport_markers(root, mudir, muname, filepath_stem=None):
         _attach_aero_surface_preview(root, text)
     except Exception as e:
         print(f"WARNING: aero surface preview: {e}")
+    # Damaged / .broken meshes — hidden by default (Tools → Broken to show)
+    try:
+        apply_broken_default_hide(root, text, hide=True)
+    except Exception as e:
+        print(f"WARNING: broken hide: {e}")
+    # ModuleWheelSuspension travel preview (amortyzatory)
+    try:
+        _attach_suspension_preview(root, text)
+    except Exception as e:
+        print(f"WARNING: suspension preview: {e}")
     # Serenity / Breaking Ground: synthesize ServoOperate from ModuleRobotic*
     try:
         from .robotics_preview import attach_robotics_preview

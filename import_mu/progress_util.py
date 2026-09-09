@@ -442,25 +442,34 @@ class MuProgressSession:
     def update(self, value=None, *, fraction=None, text=None, force=False):
         if fraction is not None:
             try:
-                value = int(round(float(fraction) * float(self.total)))
+                value = float(fraction) * float(self.total)
             except Exception:
                 value = self.value
         if value is None:
             value = self.value
         try:
-            value = int(value)
+            value = float(value)
         except Exception:
-            value = self.value
-        value = max(0, min(value, self.total))
+            try:
+                value = float(self.value)
+            except Exception:
+                value = 0.0
+        value = max(0.0, min(value, float(self.total)))
         self.value = value
+        # WM cursor ring only accepts ints
         if self._opened and self._wm is not None:
             try:
-                self._wm.progress_update(value)
+                self._wm.progress_update(int(round(value)))
             except Exception:
                 pass
         label = (text or "").strip() or "Working…"
-        pct = int(round(100.0 * value / float(self.total)))
-        status = "%s — %s (%d%%)" % (self.title, label, pct)
+        pct = 100.0 * value / float(self.total)
+        # One decimal when mid-item; whole number when exactly on a boundary
+        if abs(pct - round(pct)) < 0.05:
+            pct_s = "%d%%" % int(round(pct))
+        else:
+            pct_s = "%.1f%%" % pct
+        status = "%s — %s (%s)" % (self.title, label, pct_s)
         if status != self._last_status or force:
             prev = self._last_status
             self._last_status = status
