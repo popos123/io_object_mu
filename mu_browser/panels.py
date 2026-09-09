@@ -2639,12 +2639,6 @@ class VIEW3D_PT_mu_part_browser(bpy.types.Panel):
         if br is None:
             layout.label(text="Browser not registered", icon="ERROR")
             return
-        layout.prop(br, "like_ksp", text="like KSP", icon="SNAP_ON")
-
-        if br.like_ksp:
-            box = layout.box()
-            box.label(text="Nodes snap + attachRules", icon="INFO")
-            box.label(text="Import places a ghost under the cursor")
         try:
             from ..preferences.preferences import Preferences
             gd = (Preferences().GameData or "").strip()
@@ -2654,41 +2648,103 @@ class VIEW3D_PT_mu_part_browser(bpy.types.Panel):
             layout.label(text="Set GameData in Tool > Options", icon="ERROR")
         else:
             layout.label(text=(os.path.basename(gd.rstrip("/\\")) or gd), icon="FILE_FOLDER")
-        row = layout.row(align=True)
-        row.operator("object.ksp_mu_browser_refresh", text="Refresh", icon="FILE_REFRESH")
-        row.operator("object.ksp_mu_browser_gen_thumbs", text="Thumbs", icon="IMAGE_DATA")
-        row.operator("object.ksp_mu_browser_regen_thumbs", text="Regen", icon="FILE_REFRESH")
-        layout.prop(br, "category", text="")
-        layout.prop(br, "filter", text="", icon="VIEWZOOM")
-        # First MU-tab open: category may be set while parts are still empty.
-        _ensure_parts_populated(context, br)
-        # Sync icon-view enum to the current parts_index (usually 0).
-        _ensure_first_part_preview(br)
-        parts = br.parts
-        if not parts:
-            layout.label(text="No parts in category", icon="INFO")
+
+        # Settings stay visible even while a job runs.
+        settings_row = layout.row(align=True)
+        settings_row.prop(br, "include_stock_thumbs", text="Include stock thumbs")
+        settings_row.prop(br, "show_attach_points", text="Show attach points")
+
+        # ---- Loading / exclusive job overlay ----
+        # When GameData path is valid and catalog is scanning (or thumbs/regen
+        # is running), hide Refresh/Thumbs/Regen, category, search, thumbnails,
+        # Import and the part info labels. Only Cancel (+ progress) remains.
+        from . import operators as _ops
+        from . import catalog as _cat
+        job_kind, job_title, job_cur, job_tot = _ops.job_progress()
+        catalog_loading = bool(gd) and (
+            _cat.catalog_scan_running() or job_kind == "catalog"
+        )
+        thumbs_busy = job_kind in ("thumbs", "regen")
+        hide_browser_controls = bool(gd) and (catalog_loading or thumbs_busy)
+
+        if hide_browser_controls:
+            # Blue MU progress bar is drawn above via draw_mu_panel_progress.
+            # Only show a cancel control here; hide the rest of the browser UI.
+            if thumbs_busy:
+                cancel_row = layout.row(align=True)
+                if job_kind == "thumbs":
+                    cancel_row.operator(
+                        "object.ksp_mu_browser_gen_thumbs",
+                        text="Cancel Thumbs",
+                        icon="CANCEL",
+                    )
+                else:
+                    cancel_row.operator(
+                        "object.ksp_mu_browser_regen_thumbs",
+                        text="Cancel Regen",
+                        icon="CANCEL",
+                    )
+            elif catalog_loading:
+                cancel_row = layout.row(align=True)
+                cancel_row.operator(
+                    "object.ksp_mu_browser_refresh",
+                    text="Scanning… (click to dismiss)",
+                    icon="CANCEL",
+                )
+            # Fallback text if progress_util bar is unavailable
+            try:
+                from ..import_mu.progress_util import draw_mu_panel_progress as _dpp
+            except Exception:
+                box = layout.box()
+                if job_tot > 0:
+                    pct = int(100 * job_cur / max(1, job_tot))
+                    box.label(
+                        text="%s  %d/%d (%d%%)" % (
+                            job_title or "Working…", job_cur, job_tot, pct),
+                        icon="TIME",
+                    )
+                else:
+                    box.label(text=job_title or "Loading…", icon="TIME")
+            _ensure_parts_populated(context, br)
         else:
-            preview_box = layout.box()
-            preview_box.template_icon_view(
-                br, "part_preview", show_labels=True,
-                scale=_THUMB_SCALE, scale_popup=_THUMB_SCALE_POPUP)
-        row = layout.row(align=True)
-        op = row.operator("object.ksp_mu_browser_import_part", text="Import", icon="IMPORT")
-        if 0 <= br.parts_index < len(br.parts):
-            op.part_name = br.parts[br.parts_index].name
-        if 0 <= br.parts_index < len(br.parts):
-            item = br.parts[br.parts_index]
-            box = layout.box()
-            row = box.row(align=True)
-            row.scale_y = 0.5
-            row.label(text="Part title:   %s" % item.title)
-            row = box.row(align=True)
-            row.scale_y = 0.5
-            row.label(text="File name: %s" % item.name)
-            if item.attach_rules:
+            row = layout.row(align=True)
+            row.operator("object.ksp_mu_browser_refresh", text="Refresh", icon="FILE_REFRESH")
+            row.operator("object.ksp_mu_browser_gen_thumbs", text="Thumbs", icon="IMAGE_DATA")
+            row.operator("object.ksp_mu_browser_regen_thumbs", text="Regen", icon="FILE_REFRESH")
+            layout.prop(br, "category", text="")
+            layout.prop(br, "filter", text="", icon="VIEWZOOM")
+            # First MU-tab open: category may be set while parts are still empty.
+            _ensure_parts_populated(context, br)
+            _ensure_first_part_preview(br)
+            parts = br.parts
+            if not parts:
+                layout.label(text="No parts in category", icon="INFO")
+            else:
+                preview_box = layout.box()
+                preview_box.template_icon_view(
+                    br, "part_preview", show_labels=True,
+                    scale=_THUMB_SCALE, scale_popup=_THUMB_SCALE_POPUP)
+                try:
+                    from . import thumbnails as _th
+                    _th.schedule_preview_warmup(br, chunk_size=16)
+                except Exception:
+                    pass
+
+            row = layout.row(align=True)
+            op = row.operator("object.ksp_mu_browser_import_part", text="Import", icon="IMPORT")
+            if 0 <= br.parts_index < len(br.parts):
+                op.part_name = br.parts[br.parts_index].name
+            if 0 <= br.parts_index < len(br.parts):
+                item = br.parts[br.parts_index]
+                box = layout.box()
+                box.label(text="Selected part", icon="IMAGE_DATA")
                 row = box.row(align=True)
-                row.scale_y = 0.5
-                row.label(text="Attach rules: %s" % item.attach_rules)
+                row.label(text="Part title: %s" % item.title)
+                row = box.row(align=True)
+                row.label(text="File name: %s" % item.name)
+                if item.attach_rules:
+                    row = box.row(align=True)
+                    row.label(text="Attach rules: %s" % item.attach_rules)
 
         # ---- MU Animation (host → clips tree) + viewport FX ----
         entries = _mu_animation_entries(context)

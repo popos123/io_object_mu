@@ -1,20 +1,22 @@
 # vim:ts=4:et
 # <pep8 compliant>
 
-from .. import register_submodules
+try:
+    from .. import register_submodules
+except ImportError:
+    import register_submodules
 
 submodule_names = (
     "properties",
     "catalog",
     "thumbnails",
     "operators",
-    "snap",
     "panels",
 )
 
 # Load submodules before register_submodules — __init__ is still running at
 # this point, so a bare getattr(module, "properties") would fail.
-from . import catalog, operators, panels, properties, snap, thumbnails  # noqa: F401
+from . import catalog, operators, panels, properties, thumbnails  # noqa: F401
 
 register_submodules(__name__, submodule_names)
 
